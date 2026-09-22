@@ -1,0 +1,111 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RAB-MOQD paper framing</title><style>:root{--ink:#17212b;--paper:#f6f4ed;--blue:#176b87;--green:#177a65;--line:#d7dddf}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif;line-height:1.68}main{max-width:1040px;margin:auto;padding:46px 27px 90px}h1{font-size:clamp(2.3rem,5vw,4rem);line-height:1.05;letter-spacing:-.05em;margin:.2em 0 .7em}h2{font-size:1.55rem;margin-top:2.1em;border-top:1px solid var(--line);padding-top:1em}h3{color:var(--blue)}p,li{max-width:900px}blockquote{background:#eaf6f1;border-left:6px solid var(--green);margin:25px 0;padding:12px 20px}code{background:#e8ecec;padding:2px 5px;border-radius:4px;overflow-wrap:anywhere}pre{background:#17212b;color:white;padding:16px;border-radius:9px;overflow:auto}table{border-collapse:collapse;width:100%;background:white}th,td{border:1px solid var(--line);padding:10px;text-align:left;vertical-align:top}th{background:#e9eff1}a{color:#075f86}.hero{color:#b55725;font-weight:750;letter-spacing:.08em;text-transform:uppercase}</style></head><body><main><div class="hero">Paper framing · 2026-09-13</div><h1>RAB-MOQD 논문 프레이밍</h1>
+<h2>한 문장</h2>
+<p>RAB-MOQD는 multimodal generative model과 physics-guided realization pipeline을 하나의 비싼 확률적 black box로 보고, 해석 가능한 형태 공간의 각 영역에서 <strong>강성–재료 Pareto front</strong>를 표본 효율적으로 발견해 단일 최적해가 아닌 검증된 3D design atlas를 반환한다.</p>
+<h2>추천 제목</h2>
+<p><strong>From Concepts to Structural Repertoires: Realization-Aware Bayesian Multi-Objective Quality-Diversity for Physics-Guided 3D Design</strong></p>
+<p>짧은 대안:</p>
+<ul>
+<li><strong>A Design Atlas, Not a Single Optimum: Bayesian Multi-Objective Quality-Diversity for Generative Structural Design</strong></li>
+<li><strong>Concept-to-Structure Repertoires with Realization-Aware Bayesian Quality-Diversity</strong></li>
+</ul>
+<p>Advanced Engineering Informatics에는 첫 번째 제목이 가장 직접적이다. CVPR 계열에는 이미지 조건과 3D realization을 더 전면에 둔 세 번째 제목이 맞다.</p>
+<h2>문제 설정</h2>
+<p>입력은 concept text와 reference image/multi-view conditioning이고, 출력은 하나의 mesh가 아니라 repertoire다. 하나의 생성 recipe <code>x</code>는 seed <code>ω</code>에 따라 서로 다른 realization을 만든다.</p>
+<p><code>G(x, ω) → (mesh, b₁, b₂, C, V, validity)</code></p>
+<ul>
+<li><code>b₁</code>: normalized void scale — 평균 void-to-material clearance를 설계 영역 대각선으로 나눈 값</li>
+<li><code>b₂</code>: strain-energy concentration — 전체 에너지 크기와 독립적인 하중 전달 경로의 공간적 집중도</li>
+<li><code>C</code>: 검증 FEA compliance, 최소화</li>
+<li><code>V</code>: material volume fraction, 최소화</li>
+<li><code>validity</code>: watertight, connected, in-domain, BC-present, solvable FEA</li>
+</ul>
+<p>행동공간의 각 cell <code>k</code>는 단일 elite 대신 <code>(C,V)</code>의 비지배 Pareto set <code>Pₖ</code>를 가진다. 체적은 더 이상 hard feasibility gate가 아니다. 유효 형상은 모두 archive에 들어갈 수 있고, 사용자는 원하는 형태 cell 안에서 강성 중심 또는 재료 효율 중심 해를 사후에 선택한다.</p>
+<h2>핵심 acquisition</h2>
+<p>후보가 어느 cell에 실현될지, 유효할지, 그리고 그 cell의 Pareto front를 얼마나 개선할지 모두 posterior 아래에서 적분한다.</p>
+<p><code>α(x) = Eω,y|D [ Σₖ 1(valid) · 1(b(y)∈k) · ΔHV(Pₖ; (C(y),V(y))) ] / cost(x)</code></p>
+<p>이를 <strong>Expected Joint Hypervolume Improvement of Repertoires</strong>라고 부를 수 있다. BOP-Elites의 probabilistic cell assignment와 MOME의 cell-wise Pareto archive를 잇되, seed에 따른 realization 분포와 adaptive replication을 포함하는 것이 방법의 중심이다.</p>
+<h2>연구 공백</h2>
+<p>LMTO는 large model의 선호 지식과 topology optimization을 연결해 concept realization을 수행하지만, 하나의 concept에서 얻는 확률적 결과를 형태 공간 전체의 repertoire로 조직하거나 cell별 강성–재료 Pareto front를 표본 효율적으로 찾는 문제를 직접 다루지는 않는다.</p>
+<p>BOP-Elites는 비싼 black-box objective와 descriptor를 GP로 모델링해 sample-efficient QD를 수행하지만 기본 문제는 cell당 단일 quality elite다. MOME는 cell마다 Pareto front를 유지하지만, 비싼 생성–후처리–FEA chain과 stochastic realization을 위한 Bayesian acquisition 및 선택적 반복평가가 중심은 아니다.</p>
+<p>우리 문제는 세 조건이 동시에 존재한다.</p>
+<ol>
+<li>한 번의 3D realization과 FEA가 비싸다.</li>
+<li>descriptor와 objective가 생성 전에는 알려지지 않는다.</li>
+<li>동일 recipe도 seed와 비결정적 sparse 연산에 따라 다른 cell과 성능으로 실현된다.</li>
+</ol>
+<h2>주장할 기여</h2>
+<ol>
+<li><strong>문제정의:</strong> stochastic concept-to-structure generation을 단일 최적화가 아닌 realization-aware multi-objective QD로 정식화한다.</li>
+<li><strong>알고리즘:</strong> descriptor, compliance, volume, validity posterior를 이용한 cell-conditioned expected hypervolume acquisition을 제안한다.</li>
+<li><strong>신뢰성:</strong> provisional/verified Pareto archive와 adaptive seed replication으로 우연히 좋은 single realization이 elite가 되는 것을 억제한다.</li>
+<li><strong>시스템:</strong> concept conditioning, physics-guided dense/sparse generation, geometry validation, a-posteriori FEA를 닫힌 data acquisition loop로 통합한다.</li>
+<li><strong>실증:</strong> 고정된 full-pipeline budget에서 repertoire coverage, QD hypervolume, Pareto quality, 재현성을 비교한다. 이 항목은 향후 반복 실험에서 실제 우세가 확인된 뒤에만 강하게 주장한다.</li>
+</ol>
+<p><code>first</code> 또는 <code>state of the art</code> 주장은 더 넓은 문헌조사 전에는 사용하지 않는다.</p>
+<h2>기존 원고와의 분리</h2>
+<p>심사 중인 <em>Form Embodies Mechanics</em>의 중심은 physics-guided generative realization pipeline이다. 새 논문에서는 그 pipeline을 연구 대상 optimizer가 아니라 <strong>고비용 stochastic evaluator</strong>로 둔다.</p>
+<ul>
+<li>기존 원고의 질문: 물리 유도가 생성 형상에 역학을 어떻게 반영하는가?</li>
+<li>새 논문의 질문: 제한된 evaluation budget에서 어떤 realization들을 평가해야 디자이너에게 유용한 구조 repertoire를 얻는가?</li>
+</ul>
+<p>따라서 새 논문의 headline은 generation architecture나 physics loss가 아니라 archive semantics, acquisition, uncertainty, decision support다. <code>sp_fea_step_size=0.03</code>과 체적 repair는 시스템 ablation 또는 implementation detail로 둔다.</p>
+<h2>LMTO와의 차이</h2>
+<ul>
+<li>LMTO: human concept/preference에서 performance-optimal direction으로 구조를 발전시킨다.</li>
+<li>RAB-MOQD: 동일 concept 아래에서 morphology와 engineering trade-off가 다른 여러 검증 구조를 발견하고 지도화한다.</li>
+<li>LMTO의 질문이 “이 concept를 구조로 만들 수 있는가?”라면, 우리의 질문은 “이 concept에서 실현 가능한 구조적 선택지의 지형은 무엇인가?”이다.</li>
+</ul>
+<p>교량 사례에서는 Gothic, organic, truss-like 등의 concept가 하나의 승자 구조로 수렴하는 대신, <b>잘게 분산된 공극 ↔ 큰 아치형 개구</b>와 <b>분산된 하중 전달 ↔ 소수의 지배적 하중 경로</b>의 각 영역마다 강성–재료 Pareto 선택지를 제공하는 그림이 가장 설득력 있다.</p>
+<p><code>b₂ = 1 - exp(-KL(p || q))</code>로 두면 <code>p</code>는 element strain-energy share, <code>q</code>는 element volume share다. 균일하게 에너지를 분담하면 0에 가깝고, 일부 부재에 에너지가 집중될수록 1에 가까워진다. Compliance는 에너지의 총합이고 <code>b₂</code>는 정규화된 공간 분포이므로 둘의 역할이 구분된다.</p>
+<h2>현재 데이터가 허용하는 정직한 서술</h2>
+<p>체적 hard constraint를 제거해 기존 52개를 재분석하면 RA-QD coverage는 1/16에서 12/16으로, random은 2/16에서 13/16으로 증가한다. RA-QD의 QD score 8.288은 random 8.757보다 아직 낮다. 따라서 현재 결과는 우월성 증명이 아니라 다음 두 사실의 pilot evidence다.</p>
+<ol>
+<li>좁은 volume gate가 유효한 structural diversity 대부분을 버렸다.</li>
+<li>기존 single-objective posterior acquisition은 random보다 낫지 않아 multi-objective cell-wise acquisition이 필요하다.</li>
+</ol>
+<p>이 정직한 negative result가 새 방법론의 동기가 된다.</p>
+<h2>주 평가 지표</h2>
+<ul>
+<li><strong>Coverage:</strong> 하나 이상의 검증 Pareto solution을 가진 cell 비율</li>
+<li><strong>QD-HV:</strong> 사전 고정한 reference point를 사용한 cell별 hypervolume의 합</li>
+<li><strong>Global HV:</strong> 형태 구분을 무시한 전체 Pareto 성능; 다양성을 위해 성능을 희생했는지 확인</li>
+<li><strong>Pareto precision:</strong> surrogate가 제안한 후보 중 실제 비지배 해가 된 비율</li>
+<li><strong>Cell hit/calibration:</strong> 예측 cell 확률과 실제 cell의 일치 및 calibration</li>
+<li><strong>Reliability:</strong> 재평가 시 validity, modal-cell agreement, compliance/volume dispersion</li>
+<li><strong>Cost:</strong> wall-clock/GPU-hours와 full-pipeline evaluation 수</li>
+</ul>
+<p>QD-HV의 compliance와 volume 범위 및 reference point는 결과를 보기 전에 protocol에 고정한다.</p>
+<h2>필수 baseline</h2>
+<ol>
+<li>Scrambled Sobol random + cell-wise Pareto archive</li>
+<li>MOME/MAP-Elites + 동일 evaluator budget</li>
+<li>single-objective BOP-Elites 또는 기존 RA-QD</li>
+<li>Bayesian multi-objective optimization without behavior cells</li>
+<li>RAB-MOQD full method</li>
+</ol>
+<p>Ablation은 probabilistic cell assignment, adaptive replication, exact GP, sparse TO step size를 각각 제거한다. 체적 repair는 중심 방법이 아니므로 optional deployment ablation으로 둔다.</p>
+<h2>초록 골격</h2>
+<p>Conceptual structural design requires more than a single mechanically optimal shape: designers need distinct, interpretable alternatives and visibility into their stiffness–material trade-offs. Multimodal generative models can produce such alternatives, but their 3D realizations are expensive to validate, their geometric behaviors are unknown before generation, and repeated runs are stochastic. We formulate this setting as realization-aware multi-objective quality-diversity optimization. Our method, RAB-MOQD, models behavioral descriptors, compliance, material usage, and validity with probabilistic surrogates, and selects evaluations by their expected cell-conditioned Pareto hypervolume improvement. A provisional-to-verified archive adaptively repeats only candidates whose cell membership or Pareto status remains uncertain. The resulting design atlas organizes validated 3D structures by interpretable morphology while retaining a stiffness–material Pareto set in every region. [최종 문장에는 반복실험 후 확인된 수치만 삽입한다.]</p>
+<h2>논문에서 피할 프레이밍</h2>
+<ul>
+<li>“GPT가 topology optimization을 한다” — 실제 QD 입력은 생성 recipe이고 FEA가 검증한다.</li>
+<li>“체적 0.5를 만족시키는 생성기” — 새 문제의 핵심이 아니며 구조 선택지를 불필요하게 제거한다.</li>
+<li>“random보다 이미 우수하다” — 현재 데이터는 반대다.</li>
+<li>“다양한 이미지를 만들었다” — image diversity가 아니라 verified 3D structural repertoire가 결과다.</li>
+<li>“모든 cell에서 하나의 최고 해” — 각 cell의 Pareto front가 핵심이다.</li>
+</ul>
+<h2>현재 산출물</h2>
+<ul>
+<li><code>/home/goya/SDL/3d_qd/experiments/bracket/raqd_online_2026-09-13/no_volume_constraint_reanalysis.json</code></li>
+<li><code>/home/goya/SDL/3d_qd/experiments/bracket/raqd_online_2026-09-13/v2_posterior_audit.json</code></li>
+<li><code>/home/goya/SDL/3d_qd/experiments/bracket/rcbqd_v2_microbatch_2026-09-13/analysis.json</code></li>
+<li><code>/home/goya/SDL/3d_qd/codebase/raqd_v2_posterior.py</code></li>
+<li><code>/home/goya/SDL/3d_qd/codebase/robust_qd_archive.py</code></li>
+</ul>
+<h2>관련 연구</h2>
+<ul>
+<li>Liang et al., <em>Integrating large models with topology optimization for conceptual design realization</em>, Advanced Engineering Informatics, 2025. https://doi.org/10.1016/j.aei.2025.103524</li>
+<li>Kent et al., <em>BOP-Elites, a Bayesian Optimisation Approach to Quality Diversity Search with Black-Box Descriptor Functions</em>. https://arxiv.org/abs/2307.09326</li>
+<li>Pierrot et al., <em>Multi-Objective Quality Diversity Optimization</em>. https://arxiv.org/abs/2202.03057</li>
+<li>Flageat and Cully, <em>Uncertain Quality-Diversity</em>. https://arxiv.org/abs/2302.00463</li>
+</ul></main></body></html>

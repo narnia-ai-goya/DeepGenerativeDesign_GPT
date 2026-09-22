@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>파이프라인 데이터 흐름 — 무엇이 나오고 어디로 가는가</title>
+<style>
+  :root {
+    --ink:      #101720;
+    --ink-2:    #3d4b5c;
+    --ink-3:    #6c7d90;
+    --rule:     #d3dae2;
+    --rule-2:   #e6ebf0;
+    --paper:    #f4f6f8;
+    --card:     #ffffff;
+    --sunk:     #eef2f6;
+    --blue:     #2a78d6;
+    --blue-bg:  #e6effb;
+    --orange:   #d95926;
+    --orange-bg:#fdece4;
+    --green:    #158c62;
+    --green-bg: #e2f4ec;
+    --violet:   #6b4fc4;
+    --violet-bg:#ece7fa;
+
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, "Segoe UI", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+    --maxw: 1180px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink:#e7edf4; --ink-2:#b0bdcc; --ink-3:#8090a2;
+      --rule:#2b3542; --rule-2:#1e2732;
+      --paper:#0c1117; --card:#141b24; --sunk:#101821;
+      --blue:#5c9ceb; --blue-bg:#16283d;
+      --orange:#f0834f; --orange-bg:#33200f;
+      --green:#3fbe8c; --green-bg:#0f2a20;
+      --violet:#a693ee; --violet-bg:#221c3a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ink:#e7edf4; --ink-2:#b0bdcc; --ink-3:#8090a2;
+    --rule:#2b3542; --rule-2:#1e2732;
+    --paper:#0c1117; --card:#141b24; --sunk:#101821;
+    --blue:#5c9ceb; --blue-bg:#16283d;
+    --orange:#f0834f; --orange-bg:#33200f;
+    --green:#3fbe8c; --green-bg:#0f2a20;
+    --violet:#a693ee; --violet-bg:#221c3a;
+  }
+  :root[data-theme="light"] {
+    --ink:#101720; --ink-2:#3d4b5c; --ink-3:#6c7d90;
+    --rule:#d3dae2; --rule-2:#e6ebf0;
+    --paper:#f4f6f8; --card:#ffffff; --sunk:#eef2f6;
+    --blue:#2a78d6; --blue-bg:#e6effb;
+    --orange:#d95926; --orange-bg:#fdece4;
+    --green:#158c62; --green-bg:#e2f4ec;
+    --violet:#6b4fc4; --violet-bg:#ece7fa;
+  }
+
+  body { margin:0; background:var(--paper); color:var(--ink); font-family:var(--sans);
+         font-size:15px; line-height:1.62; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:var(--maxw); margin:0 auto; padding:40px 22px 90px; }
+
+  /* ── masthead ── */
+  .mast { border-bottom:2px solid var(--ink); padding-bottom:16px; margin-bottom:8px; }
+  .kicker { font-family:var(--mono); font-size:11.5px; letter-spacing:.14em; text-transform:uppercase;
+            color:var(--ink-3); margin:0 0 10px; }
+  h1 { font-size:clamp(25px,4.2vw,38px); line-height:1.16; margin:0; letter-spacing:-.02em;
+       text-wrap:balance; font-weight:750; }
+  .sub { color:var(--ink-2); margin:14px 0 0; max-width:66ch; font-size:15.5px; }
+
+  /* ── strip ── */
+  .strip { display:flex; align-items:stretch; gap:0; flex-wrap:wrap; margin:30px 0 4px;
+           background:var(--card); border:1px solid var(--rule); border-radius:3px; overflow:hidden; }
+  .sc { flex:1 1 150px; min-width:132px; padding:13px 14px 15px; border-right:1px solid var(--rule-2); }
+  .sc:last-child { border-right:0; }
+  .sc .n { font-family:var(--mono); font-size:10.5px; letter-spacing:.1em; color:var(--ink-3); }
+  .sc .t { font-weight:680; font-size:14px; margin-top:3px; letter-spacing:-.01em; }
+  .sc .o { font-family:var(--mono); font-size:11px; color:var(--blue); margin-top:7px; line-height:1.5;
+           word-break:break-all; }
+  .sc.deliver { background:var(--green-bg); }
+  .sc.deliver .o { color:var(--green); font-weight:650; }
+  .sc.once { background:var(--sunk); }
+
+  /* ── stage card ── */
+  .stage { background:var(--card); border:1px solid var(--rule); border-radius:4px;
+           margin:26px 0 0; overflow:hidden; }
+  .shead { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap;
+           padding:15px 20px; border-bottom:1px solid var(--rule-2); background:var(--sunk); }
+  .badge { font-family:var(--mono); font-size:11px; font-weight:700; letter-spacing:.06em;
+           padding:3px 8px; border-radius:2px; background:var(--ink); color:var(--paper); }
+  .shead h2 { font-size:18.5px; margin:0; letter-spacing:-.015em; font-weight:700; }
+  .shead .script { font-family:var(--mono); font-size:12px; color:var(--ink-3); margin-left:auto; }
+  .env { font-family:var(--mono); font-size:10.5px; padding:2px 7px; border-radius:2px; font-weight:650; }
+  .env.gpu  { background:var(--violet-bg); color:var(--violet); }
+  .env.sd   { background:var(--blue-bg);   color:var(--blue); }
+  .env.fen  { background:var(--orange-bg); color:var(--orange); }
+  .env.cpu  { background:var(--sunk);      color:var(--ink-3); border:1px solid var(--rule); }
+
+  .cols { display:grid; grid-template-columns:1fr 1.55fr 1fr; gap:0; }
+  @media (max-width:900px) { .cols { grid-template-columns:1fr; } }
+  .col { padding:16px 20px 20px; border-right:1px solid var(--rule-2); }
+  .col:last-child { border-right:0; }
+  @media (max-width:900px) { .col { border-right:0; border-bottom:1px solid var(--rule-2); } }
+  .clab { font-family:var(--mono); font-size:10.5px; letter-spacing:.13em; text-transform:uppercase;
+          color:var(--ink-3); margin-bottom:11px; }
+
+  .f { font-family:var(--mono); font-size:12.2px; display:block; margin:0 0 3px;
+       word-break:break-all; color:var(--ink); }
+  .f.in  { color:var(--ink-2); }
+  .f.out { color:var(--blue); font-weight:600; }
+  .f.key { color:var(--green); font-weight:680; }
+  .note { font-size:12.8px; color:var(--ink-3); margin:2px 0 13px; line-height:1.55; }
+  .note:last-child { margin-bottom:0; }
+
+  ol.steps { margin:0; padding:0 0 0 0; list-style:none; counter-reset:s; }
+  ol.steps > li { counter-increment:s; position:relative; padding:0 0 14px 30px; }
+  ol.steps > li:last-child { padding-bottom:0; }
+  ol.steps > li::before { content:counter(s); position:absolute; left:0; top:1px;
+       font-family:var(--mono); font-size:11px; font-weight:700; color:var(--ink-3);
+       width:19px; height:19px; line-height:19px; text-align:center;
+       border:1px solid var(--rule); border-radius:50%; }
+  ol.steps b { font-weight:660; }
+  ol.steps .sd { font-size:13px; color:var(--ink-2); display:block; margin-top:1px; }
+  ol.steps code, .col code, td code, .why code { font-family:var(--mono); font-size:11.8px;
+       background:var(--sunk); padding:1px 4px; border-radius:2px; color:var(--ink-2); }
+
+  .arrow { text-align:center; color:var(--rule); font-size:20px; line-height:1; margin:10px 0 -6px;
+           font-family:var(--mono); }
+
+  /* ── lineage table ── */
+  h3.sec { font-size:20px; margin:52px 0 6px; letter-spacing:-.015em; border-top:2px solid var(--ink);
+           padding-top:16px; }
+  .tw { overflow-x:auto; border:1px solid var(--rule); border-radius:4px; background:var(--card);
+        margin-top:16px; }
+  table { border-collapse:collapse; width:100%; font-size:13.4px; min-width:760px; }
+  th { text-align:left; font-family:var(--mono); font-size:10.5px; letter-spacing:.11em;
+       text-transform:uppercase; color:var(--ink-3); font-weight:600;
+       padding:11px 14px; border-bottom:1px solid var(--rule); background:var(--sunk); white-space:nowrap; }
+  td { padding:11px 14px; border-bottom:1px solid var(--rule-2); vertical-align:top; color:var(--ink-2); }
+  tr:last-child td { border-bottom:0; }
+  td.m { font-family:var(--mono); font-size:12.2px; color:var(--ink); white-space:nowrap; }
+  td.why { font-size:12.9px; }
+  tbody tr:hover td { background:var(--sunk); }
+
+  .callout { border-left:3px solid var(--orange); background:var(--orange-bg); padding:14px 18px;
+             margin:26px 0 0; border-radius:0 3px 3px 0; }
+  .callout .ct { font-weight:680; font-size:14px; margin:0 0 5px; color:var(--ink); }
+  .callout p { margin:0; font-size:13.6px; color:var(--ink-2); }
+  .foot { margin-top:56px; padding-top:16px; border-top:1px solid var(--rule);
+          font-size:12.5px; color:var(--ink-3); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="mast">
+    <p class="kicker">supplementary · 파이프라인 구조</p>
+    <h1>무엇이 나오고, 어디로 가서, 어떻게 되는가</h1>
+    <p class="sub">원본 CAD STL 3개에서 시작해 검증된 compliance 값까지. 각 단계의 <b>입력 → 처리 → 산출</b>과,
+    산출물이 이후 어느 단계에서 읽히는지를 추적합니다.</p>
+  </div>
+
+  <div class="strip">
+    <div class="sc once"><div class="n">STAGE 0 · 도메인당 1회</div><div class="t">입력 준비</div>
+      <div class="o">*_remesh.stl<br>voxel.npz<br>fea_domain/<br>fea_shared.msh</div></div>
+    <div class="sc"><div class="n">STAGE A · 스타일당</div><div class="t">Conditioning</div>
+      <div class="o">6뷰 조건 이미지</div></div>
+    <div class="sc"><div class="n">STAGE B · GPU</div><div class="t">생성 + 물리 guidance</div>
+      <div class="o">mesh.obj</div></div>
+    <div class="sc"><div class="n">STAGE C</div><div class="t">후처리</div>
+      <div class="o">hybrid.obj<br>final.obj</div></div>
+    <div class="sc deliver"><div class="n">STAGE D</div><div class="t">FEA 검증</div>
+      <div class="o">compliance<br>von Mises</div></div>
+  </div>
+
+  <!-- ═══════════ STAGE 0 ═══════════ -->
+  <section class="stage">
+    <div class="shead">
+      <span class="badge">STAGE 0</span>
+      <h2>입력 준비 — 원본 STL 3개에서 파생물 전부</h2>
+      <span class="env cpu">CPU</span><span class="env fen">fenics</span>
+      <span class="script">run_prep.py</span>
+    </div>
+    <div class="cols">
+      <div class="col">
+        <div class="clab">입력 — 손으로 만든 유일한 자산</div>
+        <span class="f in">data_real/&lt;dom&gt;/original_DesignSpace.stl</span>
+        <div class="note">설계 영역. 생성된 부품이 벗어날 수 없는 외곽</div>
+        <span class="f in">data_real/&lt;dom&gt;/fixed.stl</span>
+        <div class="note">고정면 (FEA에서 클램프)</div>
+        <span class="f in">data_real/&lt;dom&gt;/load.stl</span>
+        <div class="note">하중면 (1000 N 작용)</div>
+        <span class="f in">configs/&lt;dom&gt;.json → stages.prep</span>
+      </div>
+      <div class="col">
+        <div class="clab">처리 — 4단계, 각각 재실행 가능</div>
+        <ol class="steps">
+          <li><b>remesh</b> <code>remesh_domain_bc.py</code>
+            <span class="sd">원본 CAD STL은 용접되지 않은 삼각형 수프(V=3F). 정점 병합 후 등방 remesh로 정삼각형에 가깝게.</span></li>
+          <li><b>voxel</b> <code>make_bc_proper_pysdf.py</code>
+            <span class="sd">pysdf로 복셀 중심을 rasterize → 64³ 격자. 고정/하중 영역을 dilate해 BC 채널로 기록.</span></li>
+          <li><b>fea_domain</b> — 파일 스테이징
+            <span class="sd">in-loop FEM 솔버는 디렉터리 안의 <i>고정된 세 파일명</i>을 찾으므로, 역할별로 골라 그 이름으로 복사.</span></li>
+          <li><b>fea_mesh</b> <code>fenics_fea_bracket.py --build-mesh-only</code>
+            <span class="sd">설계 영역은 모든 프롬프트에서 동일 → tet를 <b>한 번만</b> 만들어 전 실험이 공유.</span></li>
+        </ol>
+      </div>
+      <div class="col">
+        <div class="clab">산출 — 같은 도메인 폴더로</div>
+        <span class="f out">original_DesignSpace_remesh.stl</span>
+        <span class="f out">fixed_remesh.stl · load_remesh.stl</span>
+        <div class="note">→ Stage C 후처리, Stage D 검증의 BC면, in-loop FEM의 peg면</div>
+        <span class="f out">voxel.npz</span>
+        <div class="note">→ Stage B가 <code>bc_proper</code>와 <code>bracket_occ</code> 두 역할로 읽음</div>
+        <span class="f out">fea_domain/{원본,고정,하중}.stl</span>
+        <div class="note">→ Stage B의 in-loop FEM 도메인</div>
+        <span class="f out">fea_shared.msh</span>
+        <div class="note">→ Stage B 전 실험이 공유 (45회 → 3회 tet 생성)</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="arrow">▼</div>
+
+  <!-- ═══════════ STAGE A ═══════════ -->
+  <section class="stage">
+    <div class="shead">
+      <span class="badge">STAGE A</span>
+      <h2>Conditioning — 스타일을 6개 뷰 이미지로</h2>
+      <span class="env sd">sd</span><span class="env cpu">pyvista</span>
+      <span class="script">run_conditioning.py</span>
+    </div>
+    <div class="cols">
+      <div class="col">
+        <div class="clab">입력</div>
+        <span class="f in">data_real/&lt;dom&gt;/*.stl <span style="color:var(--ink-3)">(원본)</span></span>
+        <div class="note">렌더·마스크는 기하만 쓰므로 원본 STL 기준</div>
+        <span class="f in">configs/curated_prompts.json</span>
+        <div class="note">스타일당 <code>prompt</code> · <code>negative</code> · <code>descriptor</code> · <code>form</code></div>
+        <span class="f in">stages.cond_ref / cond_stylize / cond_img2img</span>
+        <div class="note">모든 수치가 config에서 나옴 — 스크립트에 하드코딩 없음</div>
+      </div>
+      <div class="col">
+        <div class="clab">처리 — 6단계 (text-first 전체 경로)</div>
+        <ol class="steps">
+          <li><b>render</b> <code>cond_render_pv.py</code>
+            <span class="sd">도메인 기하를 6방향 1024px 렌더 → <code>renders/</code>. 도메인당 캐시.</span></li>
+          <li><b>masks</b> <code>cond_render_masks.py</code>
+            <span class="sd">고정/하중 영역의 가림 마스크 → <code>masks/</code>. 스타일이 침범하면 안 되는 곳.</span></li>
+          <li><b>ref</b> <code>text2img_style_ref.py</code>
+            <span class="sd">SDXL t2i(<code>descriptor + ref_common</code>) → 중앙 crop 0.35 → 1024 확대 → 256개 문턱값 전수 탐색으로 <b>검정 35%</b> 이진화. 결과는 “검정 구조 / 흰 구멍” 두 색 타일.</span></li>
+          <li><b>inpaint</b> <code>cond_stylize_inpaint_refip_xattn.py</code>
+            <span class="sd">SDXL inpaint + IP-Adapter(ref) + cross-view attention. renders에 마스크 밖 영역만 스타일을 새김 → <code>remask/</code>.</span></li>
+          <li><b>normalize</b> <code>nonblack_to_white.py</code>
+            <span class="sd">휘도 정규화. BC 영역은 검정(=재료)으로 채워 보호 → <code>white/</code>.</span></li>
+          <li><b>img2img</b> <code>cond_img2img_consolidate.py</code>
+            <span class="sd">SDXL img2img(<code>ip_scale 0</code>, strength 0.7 → 실제 28 step)로 6뷰 톤 통일 + 구멍 경계 선명화.</span></li>
+        </ol>
+      </div>
+      <div class="col">
+        <div class="clab">산출</div>
+        <span class="f out">data/&lt;dom&gt;/conditioning/&lt;style&gt;/v*.png</span>
+        <div class="note">최종 6뷰 — <code>v00_front_lo</code>, <code>v02_right_lo</code>, <code>v04_back_lo</code>,
+          <code>v06_left_lo</code>, <code>v_top</code>, <code>v_bottom</code>. → Stage B가 읽는 유일한 조건 입력</div>
+        <span class="f in">experiments/&lt;ER&gt;/&lt;dom&gt;/cond/…</span>
+        <div class="note">중간 산출물(renders, masks, ref, remask, white)은 실험 폴더에 남아 추적 가능</div>
+        <div style="margin-top:16px; padding-top:14px; border-top:1px solid var(--rule-2)">
+          <div class="clab">image-first 진입</div>
+          <div class="note" style="margin-bottom:0">Stage A를 건너뛰고 6뷰를 직접
+            <code>data/&lt;dom&gt;/conditioning/&lt;style&gt;/</code>에 두면 됨. 이후 단계는 완전히 동일.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="arrow">▼</div>
+
+  <!-- ═══════════ STAGE B ═══════════ -->
+  <section class="stage">
+    <div class="shead">
+      <span class="badge">STAGE B</span>
+      <h2>생성 — 확산 과정에 물리를 개입</h2>
+      <span class="env gpu">direct3ds2 · GPU</span><span class="env fen">fenics 서브프로세스</span>
+      <span class="script">generate_with_physics_guidance.py</span>
+    </div>
+    <div class="cols">
+      <div class="col">
+        <div class="clab">입력 — 4갈래가 합류</div>
+        <span class="f in">conditioning/&lt;style&gt;/v*.png</span>
+        <div class="note">Stage A 산출 · 형상의 “모양”을 결정</div>
+        <span class="f in">voxel.npz</span>
+        <div class="note">Stage 0 산출 · 설계 영역 + BC 격자</div>
+        <span class="f in">fea_domain/ + fea_shared.msh</span>
+        <div class="note">Stage 0 산출 · in-loop FEM이 쓰는 도메인과 tet</div>
+        <span class="f in">stages.mesh (~40개 값)</span>
+        <div class="note">seed 42, <code>--deterministic</code>, <code>FEA_NORMALIZE=0</code></div>
+      </div>
+      <div class="col">
+        <div class="clab">처리 — 2단 cascade, 매 step guidance</div>
+        <ol class="steps">
+          <li><b>dense 64³</b>
+            <span class="sd">latent에 직접 gradient guidance: 영역 밖 억제 <code>out_w 30</code>, BC 유지 <code>bc_w 10</code>,
+            부피·대칭·두께·최소반경, 그리고 <b>FEM compliance</b> <code>fea_w</code>
+            (warmup 0.3 이후, SIMP <code>penal 2</code>) — 도메인별 <code>bracket 1.5e-12</code> · <code>mm 7.5e-12</code> · <code>link 4.5e-14</code>.</span></li>
+          <li><b>in-loop FEM</b> <code>fenics_fea_bracket.py</code>
+            <span class="sd">서브프로세스로 호출(<code>FEA_FENICS_BIN</code>). <code>fea_shared.msh</code>에 현재 밀도를 실어
+            선형탄성을 풀고 <b>compliance의 민감도</b>를 돌려줌. 하중 방향은 <code>LOAD_MODE</code>로 전달.</span></li>
+          <li><b>sparse 512³</b>
+            <span class="sd">50 step. 표면 법선/Laplacian 정칙화(<code>sp_lap_w 50</code>), 내부 채움
+            <code>sp_interior_w 10</code>, 최소 반경, FEM 항 <code>sp_fea_w</code> (도메인별 <code>3e-11</code> / <code>1.5e-10</code> / <code>9e-13</code>).</span></li>
+        </ol>
+        <div class="note" style="margin-top:12px">↳ 두 cascade 모두 <b>같은 하중 방향</b>을 씀.
+          <code>stages.mesh.load_mode</code> ≠ <code>stages.fea.force_dir</code>이면 orchestrator가 실행 전에 중단.</div>
+      </div>
+      <div class="col">
+        <div class="clab">산출</div>
+        <span class="f out">mesh.obj</span>
+        <div class="note">생성된 원 형상. → Stage C 입력</div>
+        <span class="f out">mesh.glb · mesh_dense.obj</span>
+        <div class="note">뷰어용 / dense 단계 중간 결과</div>
+        <span class="f out">gen.log · loss csv</span>
+        <div class="note">step별 <code>fea_comp</code>, <code>l_rmin</code>, <code>l_thick</code> … 추적</div>
+        <div style="margin-top:16px; padding-top:14px; border-top:1px solid var(--rule-2)">
+          <div class="clab">Ablation</div>
+          <div class="note" style="margin-bottom:0"><code>run_ablation.py</code>가 같은 함수를 재사용해
+            <code>abl/&lt;variant&gt;/</code>에 기록. <code>off</code> = FEM 항만 제거, 나머지 전부 동일.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="arrow">▼</div>
+
+  <!-- ═══════════ STAGE C ═══════════ -->
+  <section class="stage">
+    <div class="shead">
+      <span class="badge">STAGE C</span>
+      <h2>후처리 — 조립 가능한 부품으로</h2>
+      <span class="env gpu">direct3ds2</span>
+      <span class="script">stages.post</span>
+    </div>
+    <div class="cols">
+      <div class="col">
+        <div class="clab">입력</div>
+        <span class="f in">mesh.obj</span>
+        <span class="f in">*_remesh.stl <span style="color:var(--ink-3)">(고정 · 하중 · 설계영역)</span></span>
+        <div class="note">Stage 0 산출을 여기서 처음 씀</div>
+        <span class="f in">stages.post</span>
+        <div class="note">peg dilate, <code>edge_mm</code>, <code>laplacian_iters/lamb</code></div>
+      </div>
+      <div class="col">
+        <div class="clab">처리 — 2단계</div>
+        <ol class="steps">
+          <li><b>union + clip</b> <code>post_hybrid_union_clip.py</code>
+            <span class="sd">manifold3d로 생성 형상 ∪ 고정/하중 peg를 메시 수준에서 합집합(peg 목둘레는 국소 marching cubes로 확장),
+            이어서 설계 영역으로 clip. <b>본체는 재샘플링하지 않음.</b></span></li>
+          <li><b>remesh + smooth</b> <code>surface_remesh_pre.py</code>
+            <span class="sd">등방 remesh(<code>edge_mm</code>) + Laplacian smoothing. boolean이 남긴 sliver 삼각형과 주름을 제거.</span></li>
+        </ol>
+      </div>
+      <div class="col">
+        <div class="clab">산출</div>
+        <span class="f out">hybrid.obj</span>
+        <div class="note">boolean 직후 중간 결과 — 실측 face 수 bracket 47만 · motor_mount 84만 · link 4.6만. 다음 단계의 입력일 뿐.</div>
+        <span class="f key">final.obj &nbsp;← 배포 형상</span>
+        <div class="note">파이프라인이 실제로 산출하는 부품. → Stage D가 검증하는 대상</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="arrow">▼</div>
+
+  <!-- ═══════════ STAGE D ═══════════ -->
+  <section class="stage">
+    <div class="shead">
+      <span class="badge">STAGE D</span>
+      <h2>검증 — 사후 FEA</h2>
+      <span class="env fen">fenics</span>
+      <span class="script">fea_prep_and_run.py</span>
+    </div>
+    <div class="cols">
+      <div class="col">
+        <div class="clab">입력</div>
+        <span class="f key">final.obj</span>
+        <div class="note">배포 형상을 그대로 검증</div>
+        <span class="f in">fixed_remesh.stl · load_remesh.stl</span>
+        <div class="note">BC면. 원본 CAD peg는 삼각형이 너무 커서 6 mm 근접 판정을 통과 못 함
+          (link는 peg 면의 약 29%를 놓침) → remesh판을 씀</div>
+        <span class="f in">stages.fea</span>
+        <div class="note"><code>E 110 GPa</code>, <code>ν 0.3</code>, <code>1000 N</code>,
+          <code>force_dir</code>, <code>tet_size</code></div>
+      </div>
+      <div class="col">
+        <div class="clab">처리 — 준비 후 별도 프로세스에서 해석</div>
+        <ol class="steps">
+          <li><b>표면 정리</b> pymeshlab + pymeshfix
+            <span class="sd">등방 remesh(<code>target_edge_mm</code> — bracket·mm 2.5 mm, link 1.5 mm) → 정점 병합·비다양체 복구·구멍 닫기 → 최대 성분만 남겨 watertight 보장.
+            <b>quadric decimation은 쓰지 않음</b> — 얇은 격자 부재가 사라지므로.</span></li>
+          <li><b>tet + 해석</b> <code>fea_tet_from_mesh.py</code> <span style="color:var(--ink-3)">(서브프로세스)</span>
+            <span class="sd">gmsh HXT로 4면체 생성 → DOLFINx 선형탄성. 고정면 클램프, 하중면에 1000 N 분포.
+            실패 시 escalation(HXT→Delaunay→edge 확대→repair fallback).</span></li>
+        </ol>
+        <div class="note" style="margin-top:12px">↳ pymeshlab과 gmsh/dolfinx는 <b>한 프로세스에 공존할 수 없음</b>
+          (libstdc++ 심볼 충돌). 프로세스 분리가 이 단계의 전제.</div>
+      </div>
+      <div class="col">
+        <div class="clab">산출</div>
+        <span class="f out">fea_input_clean.stl</span>
+        <div class="note">해석에 실제로 들어간 표면 — 재현·디버깅용</div>
+        <span class="f key">fea_tet_summary.json</span>
+        <div class="note"><code>compliance</code>, <code>vm_max</code>, <code>u_max</code>,
+          <code>n_tet_cells</code>, <code>force_dir</code></div>
+        <div style="margin-top:16px; padding-top:14px; border-top:1px solid var(--rule-2)">
+          <div class="clab">재실행</div>
+          <div class="note" style="margin-bottom:0"><code>refea.py</code>가 값이 없거나 범위를 벗어난 실행만 골라
+            <b>직렬로</b> 다시 계산. gmsh 병렬 실행이 불안정하기 때문.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="callout">
+    <p class="ct">이번 변경 — 검증 입력을 hybrid.obj → final.obj 로</p>
+    <p>배포하는 형상을 검증하는 것이 맞고, 부수적으로 tet 생성이 훨씬 안정적입니다.
+    10개 실행 <b>전부 첫 시도에서 통과</b>(기존에는 4건이 escalation, 1건은 8개 경로 전부 실패).
+    compliance는 대체로 2~4% 증가하며, ON/OFF가 같은 단계에 착지하므로 ΔC 비교가 처음으로 동일 기준이 됩니다.</p>
+  </div>
+
+  <!-- ═══════════ LINEAGE ═══════════ -->
+  <h3 class="sec">파일 계보 — 누가 만들고 누가 읽는가</h3>
+  <p class="note" style="max-width:70ch">특히 <b>같은 기하가 두 가지 판본으로 존재</b>하는 이유가 여기 있습니다.
+  원본판과 remesh판을 쓰는 곳이 각각 다르고, 그 선택마다 측정된 근거가 있습니다.</p>
+  <div class="tw">
+  <table>
+    <thead><tr><th>산출물</th><th>만든 단계</th><th>읽는 단계</th><th>왜 이 판본인가</th></tr></thead>
+    <tbody>
+      <tr><td class="m">original_DesignSpace.stl<br><span style="color:var(--ink-3)">원본</span></td>
+        <td>손으로 제작</td><td>Stage 0(복셀·fea_domain) · Stage A(렌더)</td>
+        <td class="why">복셀 격자의 pitch·origin이 이 STL의 bbox에서 나옴. remesh는 외곽 모서리를 둥글려
+          (link 최대 1.47 mm) 생성 좌표계 자체를 옮김. gmsh도 bracket의 remesh 도메인은
+          “겹치는 facet”으로 거부.</td></tr>
+      <tr><td class="m">*_remesh.stl</td>
+        <td>Stage 0 · remesh</td><td>Stage C · Stage D · Stage B(in-loop peg면)</td>
+        <td class="why">원본 CAD peg는 큰 평면 하나가 삼각형 몇 개뿐이어서, 솔버의 6 mm 정점 근접 판정에
+          경계 노드가 걸리지 않음.</td></tr>
+      <tr><td class="m">voxel.npz</td>
+        <td>Stage 0 · voxel</td><td>Stage B</td>
+        <td class="why">64³ 하나로 <code>bc_proper</code>(고정·하중 채널)와
+          <code>bracket_occ</code>(설계 영역 점유) 두 역할을 겸함.</td></tr>
+      <tr><td class="m">fea_domain/</td>
+        <td>Stage 0 · fea_domain</td><td>Stage B의 in-loop FEM</td>
+        <td class="why">솔버가 고정된 세 파일명을 디렉터리에서 찾음. 역할별로 판본이 다름 —
+          설계 영역은 <b>원본</b>, peg는 <b>remesh</b>.</td></tr>
+      <tr><td class="m">fea_shared.msh</td>
+        <td>Stage 0 · fea_mesh</td><td>Stage B 전 실행이 공유</td>
+        <td class="why">tet 대상이 설계 영역이라 프롬프트와 무관하게 동일. 실행마다 만들 필요가 없음.</td></tr>
+      <tr><td class="m">conditioning/&lt;style&gt;/v*.png</td>
+        <td>Stage A · img2img</td><td>Stage B</td>
+        <td class="why">image-first는 이 경로에 직접 6뷰를 넣는 것이 전부 — 두 진입점이 만나는 지점.</td></tr>
+      <tr><td class="m">mesh.obj</td><td>Stage B</td><td>Stage C</td>
+        <td class="why">guidance가 만든 원 형상. peg도 설계영역 clip도 아직 없음.</td></tr>
+      <tr><td class="m">hybrid.obj</td><td>Stage C · union+clip</td><td>Stage C · remesh</td>
+        <td class="why">중간 산출물. 검증에는 더 이상 쓰지 않음.</td></tr>
+      <tr><td class="m" style="color:var(--green)">final.obj</td><td>Stage C · remesh+smooth</td>
+        <td>Stage D · 결과 렌더</td>
+        <td class="why">파이프라인의 배포 형상. 검증 대상이자 그림에 실리는 메시.</td></tr>
+      <tr><td class="m" style="color:var(--green)">fea_tet_summary.json</td><td>Stage D</td>
+        <td>비교 표 · <code>refea.py</code> 건전성 검사</td>
+        <td class="why">compliance 상한(1 J)을 넘으면 퇴화한 tet로 보고 실패 처리 — 쓰레기 값이 표에 들어가지 않도록.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <!-- ═══════════ RUNNING ═══════════ -->
+  <h3 class="sec">실행 — orchestrator는 <code>--config</code>와 경로만 넘긴다</h3>
+  <div class="tw">
+  <table>
+    <thead><tr><th>명령</th><th>하는 일</th></tr></thead>
+    <tbody>
+      <tr><td class="m">run_prep.py --domain all</td><td>Stage 0 · 도메인당 1회. 출력이 있으면 건너뜀</td></tr>
+      <tr><td class="m">run_conditioning.py --domain … --style …</td><td>Stage A · text-first 6단계</td></tr>
+      <tr><td class="m">run_from_text.py</td><td>Stage A → B → C → D 전체</td></tr>
+      <tr><td class="m">run_from_image.py --stage gen,post,fea</td><td>Stage B → C → D (조건 이미지가 이미 있을 때)</td></tr>
+      <tr><td class="m">run_ablation.py</td><td>같은 스테이지 함수로 variant별 실행 → <code>abl/&lt;variant&gt;/</code></td></tr>
+      <tr><td class="m">refea.py --domain all</td><td>Stage D만 직렬 재실행</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="note" style="margin-top:14px; max-width:72ch">모든 하이퍼파라미터는
+  <code>configs/&lt;dom&gt;.json</code>의 <code>stages.*</code>에 있고, 스크립트는 <code>apply_config()</code>로
+  그 값을 argparse 기본값에 주입합니다. orchestrator가 넘기는 것은 <code>--config</code>와 실행별 입출력 경로뿐이라,
+  값을 바꾸려면 config만 고치면 됩니다. 세 도메인은 <b>완전히 같은 코드 경로</b>를 타고, 값만 다릅니다.</p>
+
+  <p class="foot">환경 3개 · <span style="font-family:var(--mono)">direct3ds2</span>(백본·GPU) ·
+    <span style="font-family:var(--mono)">sd</span>(SDXL·compel) ·
+    <span style="font-family:var(--mono)">fenics</span>(DOLFINx·gmsh·pymeshlab) —
+    각 단계가 어느 환경에서 도는지는 카드 머리의 배지 참고. seed 42 · 결정론적 실행.</p>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,9 @@
+experiment,tier,full_pipeline_calls,assumed_minutes_per_call,reserved_pipeline_hours,ideal_3gpu_days,days_with_30pct_margin,exclusions
+development,base,256,13,55.467,0.77,1.001,image bank; low-fidelity calls; extra FEA; TO baselines; implementation
+main_8cad_4methods_5runs_32eval,base,5120,13,1109.333,15.407,20.03,image bank; low-fidelity calls; extra FEA; TO baselines; implementation
+ablation_4variants_4cad_3runs_32eval,base,1536,13,332.8,4.622,6.009,image bank; low-fidelity calls; extra FEA; TO baselines; implementation
+recipe_repeats_64x3,base,192,13,41.6,0.578,0.751,image bank; low-fidelity calls; extra FEA; TO baselines; implementation
+quality_only_bo_4cad_3runs_32eval,base,384,13,83.2,1.156,1.502,image bank; low-fidelity calls; extra FEA; TO baselines; implementation
+cvpr_4_more_cad,optional,2560,13,554.667,7.704,10.015,image bank; low-fidelity calls; extra FEA; TO baselines; implementation
+cvpr_second_backbone,optional,768,13,166.4,2.311,3.004,image bank; low-fidelity calls; extra FEA; TO baselines; implementation
+cvpr_budget_extension_32_to_64,optional,1280,13,277.333,3.852,5.007,image bank; low-fidelity calls; extra FEA; TO baselines; implementation

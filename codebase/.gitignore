@@ -1,0 +1,39 @@
+# 대용량 산출물 — 리포에 올리지 않는다 (3.5GB 중 3.4GB)
+experiments
+data
+
+# 파이썬
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# 자격증명 — 실수로 리포 안에 두더라도 커밋되지 않게
+.openai_key
+.env
+*_key
+*secret*
+openai.json
+
+# 임시
+*.log
+*.tmp
+.DS_Store
+
+# 생성 데이터는 /mnt/door2/personal/goya/caliper_supplementary_data/ 로 옮기고
+# experiments, data 는 그곳을 가리키는 심볼릭 링크다 (위에서 이미 제외됨).
+
+# data_real: 입력 CAD(original_DesignSpace / fixed / load .stl)와 스트레치 배율만 추적한다.
+# 파생물(*_remesh.stl, voxel.npz, fea_domain/, fea_shared*.msh)은 run_prep.py 가 만든다:
+#     python run_prep.py --domain all
+# 도메인 간 심볼릭 링크는 상대경로라 클론 후에도 유효하다.
+data_real/**/*_remesh.stl
+data_real/**/voxel.npz
+data_real/**/fea_shared*.msh
+data_real/**/fea_domain
+data_real/**/fea_domain/
+
+# 잠금 파일과 08-04 시점의 미참조 잔여물 (config/code 어디서도 참조하지 않음)
+*.msh.lock
+data_real/caliper/caliper_base.obj
+data_real/caliper/fix.obj
+data_real/caliper/load.obj

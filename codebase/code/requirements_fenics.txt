@@ -1,0 +1,18 @@
+# A-posteriori FEM verification + in-loop FEA environment (conda env: python 3.11)
+# Recommended via conda-forge:
+#   conda install -c conda-forge fenics-dolfinx=0.9.0 gmsh mpich
+fenics-dolfinx==0.9.0
+ufl==2024.2.0
+basix==0.9.0
+petsc4py==3.23.0
+mpi4py==4.1.1
+gmsh==4.15.0
+meshio==5.3.5
+numpy==2.4.3
+scipy==1.17.1
+trimesh==4.11.4
+pymeshfix==0.18.1
+# pymeshlab is only used by fea_prep_and_run.py's remesh step, which runs in its own process:
+# importing it before gmsh / dolfinx in the SAME process breaks them (it loads a system
+# libstdc++ without CXXABI_1.3.15 / GLIBCXX_3.4.31). Keep the tet+solve step a subprocess.
+pymeshlab==2025.7.post1

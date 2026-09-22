@@ -1,0 +1,24 @@
+# Generation + SDXL inpainting environment (conda env: python 3.10)
+# GPU: NVIDIA RTX 4090 (24 GB), CUDA 12.1
+# Install torch/torchvision from the CUDA 12.1 index:
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1
+torchvision==0.20.1
+diffusers==0.31.0
+transformers==4.40.2
+accelerate==1.13.0
+numpy==2.2.6
+scipy==1.15.3
+scikit-image==0.25.2
+trimesh==4.12.2
+pymeshlab==2025.7.post1
+pymeshfix==0.18.1
+pysdf==0.1.9
+manifold3d==3.4.1
+Pillow==12.1.1
+safetensors==0.8.0rc0
+huggingface-hub==0.36.2
+# + Direct3D-S2 backbone (pretrained, installed separately from its public release)
+# conditioning stage (optional, run_conditioning.py)
+pyvista
+compel

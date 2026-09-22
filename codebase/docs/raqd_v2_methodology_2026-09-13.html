@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bracket RA-QD v2 방법론 탐색</title>
+<style>
+:root{--ink:#17212b;--muted:#596875;--blue:#176b87;--green:#177a65;--orange:#b75b22;--paper:#f7f5ef;--card:#fff;--line:#d9dedf}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif;line-height:1.62}
+main{max-width:1120px;margin:auto;padding:46px 25px 80px}h1{font-size:clamp(2rem,4vw,3.6rem);line-height:1.08;letter-spacing:-.045em;margin:.25em 0}.kicker{color:var(--orange);font-weight:750;letter-spacing:.08em;text-transform:uppercase}.lead{font-size:1.2rem;max-width:900px}.verdict{border-left:6px solid var(--green);background:#edf7f3;padding:19px 22px;margin:28px 0;font-size:1.08rem}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px}.num{font-size:2rem;font-weight:800;color:var(--blue)}h2{margin-top:44px;font-size:1.7rem;letter-spacing:-.025em}h3{margin:.2em 0 .5em}img{display:block;width:100%;background:white;border:1px solid var(--line);border-radius:9px}table{width:100%;border-collapse:collapse;background:#fff;font-size:.94rem}th,td{border:1px solid var(--line);padding:10px;vertical-align:top;text-align:left}th{background:#edf1f2}.best{background:#eef8f4}code,.path{font-family:ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;align-items:stretch}.step{background:#fff;border:1px solid var(--line);border-top:5px solid var(--blue);padding:15px;border-radius:9px;position:relative}.step:not(:last-child):after{content:"→";position:absolute;right:-16px;top:43%;z-index:2;font-weight:900;color:var(--orange)}.eq{padding:14px;background:#17212b;color:#f3f6f7;border-radius:8px;text-align:center;font-family:ui-monospace,monospace;overflow:auto}.small{color:var(--muted);font-size:.9rem}.tag{display:inline-block;border-radius:99px;padding:3px 9px;background:#e6eef1;color:#285160;font-size:.8rem;font-weight:700}.defer{opacity:.65}a{color:#075d85}.refs li{margin-bottom:.55em}@media(max-width:760px){.flow{grid-template-columns:1fr}.step:not(:last-child):after{content:"↓";right:50%;top:auto;bottom:-19px}}
+</style>
+</head>
+<body><main>
+<div class="kicker">Method exploration · 2026-09-13</div>
+<h1>Realization-Calibrated Bayesian QD</h1>
+<p class="lead">Bracket의 image+text→3D 생성기는 같은 조건에서도 seed에 따라 결과가 크게 달라지고, 최종 체적 제약은 매우 좁다. 추천 방법은 <b>확률 제약 BOP-Elites + sparse-stage 체적 repair + 불확실 elite 재평가</b>를 하나의 루프로 묶는 RC-BQD다.</p>
+<div class="verdict"><b>판정:</b> 기존 RA-QD의 posterior를 조금 개선하는 것만으로는 부족하다. 생성 후 얻는 sparse geometry가 final 체적을 거의 정확히 예측하므로, 이를 관측하는 즉시 목표 체적으로 보정하고 그 성공확률까지 acquisition에 반영하는 것이 이 프레임워크에 가장 잘 맞는다.</div>
+
+<h2>기존 52회가 보여준 것</h2>
+<div class="grid">
+ <div class="card"><div class="num">2 / 18</div><b>posterior 선택의 실제 체적 통과</b><p class="small">비무작위 RA-QD 18개는 posterior 표본상 전부 통과였지만 실제 통과는 2개(11.1%).</p></div>
+ <div class="card"><div class="num">0.997</div><b>sparse↔final 체적 순위상관</b><p class="small">유효한 51개 전부에서 강한 전달 관계가 유지됐다.</p></div>
+ <div class="card"><div class="num">0.9986</div><b>sparse→final 선형 R²</b><p class="small">final ≈ 0.993·sparse + 0.0160. final 0.500에 대응하는 sparse 목표는 0.4874.</p></div>
+ <div class="card"><div class="num">10.0%</div><b>RA-QD adaptive 통과율</b><p class="small">Random은 15.0%. 현재 방식은 feasibility 탐색에서 random을 넘지 못했다.</p></div>
+</div>
+<p><img src="../../experiments/bracket/raqd_online_2026-09-13/methodology_diagnostics.png" alt="Posterior calibration, sparse-final transfer, and feasibility comparison"></p>
+<p class="small">posterior 체적 MAE 0.0505, descriptor MAE 0.7845/0.1107, 목표 cell 적중률 15%. 같은 genome의 3-seed 반복에서 final 체적 범위 중앙값은 0.0475였다. 관측적 parameter 상관은 교란되어 있으므로 인과효과로 해석하지 않는다.</p>
+
+<h2>제안하는 루프</h2>
+<div class="flow">
+ <div class="step"><span class="tag">1 · MODEL</span><h3>실현 분포 학습</h3>혼합형 exact GP가 descriptor, log compliance, sparse/final volume과 seed 변동을 예측한다.</div>
+ <div class="step"><span class="tag">2 · ACQUIRE</span><h3>확률적 cell 개선</h3>각 cell에 들어갈 확률, archive 개선량, 보수적 제약 통과확률을 함께 적분한다.</div>
+ <div class="step"><span class="tag">3 · REPAIR</span><h3>sparse 체적 보정</h3>512³ raw SDF를 저장하고 iso-level을 이분 탐색해 sparse 목표 0.4874 부근으로 맞춘다.</div>
+ <div class="step"><span class="tag">4 · VERIFY</span><h3>불확실 elite 재평가</h3>cell 경계나 elite 교체가 불확실할 때만 seed를 추가해 robust archive를 갱신한다.</div>
+</div>
+
+<h2>Acquisition 정의</h2>
+<p>후보 <i>x</i>가 cell <i>b</i>에 들어갈 확률과 repair 후 체적 제약을 통과할 확률을 유지한 채, 현재 elite보다 compliance가 좋아질 기대값을 합한다. 실행비용으로 나눠 batch 예산을 배분한다.</p>
+<div class="eq">A(x) = (1 / cost(x)) Σ_b P(B(x)=b) · LCB[P(0.475≤V(R(x))≤0.525)] · E[(Cᵦ−C(x))₊]</div>
+<p>빈 cell에는 고정 exploration bonus를 준다. 체적 확률은 이진 classifier보다 연속 체적 GP에서 <code>Φ((0.525−μ)/σ)−Φ((0.475−μ)/σ)</code>로 계산한다. 현재 feasible 표본이 6개뿐이라 binary classification은 불안정하다. 확률의 lower confidence bound를 쓰면 한 번의 운 좋은 Thompson draw가 후보를 통과시키는 문제를 막을 수 있다.</p>
+
+<h2>네 접근의 비교</h2>
+<table><thead><tr><th>접근</th><th>장점</th><th>현재 데이터에서의 한계</th><th>판정</th></tr></thead><tbody>
+<tr><td>Chance-constrained Thompson RA-QD</td><td>현재 코드에서 가장 빨리 구현</td><td>한 함수 표본의 오차에 선택이 크게 흔들리고 cell별 expected gain을 직접 계산하지 않음</td><td>빠른 ablation</td></tr>
+<tr><td>Constrained BOP-Elites</td><td>descriptor 불확실성과 cell별 improvement를 자연스럽게 결합</td><td>그 자체로 seed 변동과 체적 repair를 해결하지 않음</td><td>핵심 acquisition 및 강한 baseline</td></tr>
+<tr><td>Uncertain-QD adaptive sampling</td><td>elite의 재현성과 noisy archive를 직접 다룸</td><td>낮은 feasibility 상황에서는 재평가 전에 유효 후보를 찾는 장치가 필요</td><td>archive 계층에 채택</td></tr>
+<tr><td>Trust-region constrained BO</td><td>찾은 feasible basin 안에서 국소 개선이 강함</td><td>전역 cell coverage의 주 알고리즘으로는 맞지 않음</td><td>cell 내부 optimizer로 선택 사용</td></tr>
+<tr class="best"><td><b>RC-BQD</b></td><td>위 세 요소와 파이프라인 고유의 sparse→final 전달성을 통합</td><td>repair가 형상/descriptor/compliance를 얼마나 바꾸는지 먼저 검증해야 함</td><td><b>추천</b></td></tr>
+</tbody></table>
+
+<h2>Posterior는 이렇게 바꾸는 편이 좋다</h2>
+<ul>
+ <li><b>Exact GP:</b> 입력은 style categorical kernel × 연속변수 Matérn-5/2 ARD. 3개 연속변수와 수백 표본 규모에서는 RFF 근사보다 calibration을 확인하기 쉽다.</li>
+ <li><b>Aleatoric noise:</b> seed를 단순 고정 noise로 지우지 않고 style별 또는 입력 의존 noise로 추정한다. 현재 descriptor-0, volume, log-compliance noise가 8개 batch 모두 코드 상한 0.5에 걸렸다.</li>
+ <li><b>Robust likelihood:</b> outlier에 민감한 Gaussian 하나 대신 Student-t likelihood 또는 robust residual model을 비교한다.</li>
+ <li><b>Cell 확률:</b> descriptor 평균으로 cell 하나를 고정하지 않고 posterior sample/수치적분으로 여러 cell의 소속확률을 유지한다.</li>
+ <li><b>Batch:</b> qNEI류 joint Monte Carlo 또는 local penalization으로 batch를 만들고, 무조건 epsilon-random 대신 posterior calibration이 나쁠 때 exploration을 늘린다.</li>
+</ul>
+
+<h2>Repair가 가장 먼저인 이유</h2>
+<p>한 평가의 중앙 실행시간은 generation 673초, post 43초, FEA 13초였다. 비용의 대부분을 쓴 직후 나오는 sparse geometry가 final 체적을 매우 잘 예측한다. 이 지점에서 raw SDF iso-level을 조절하면 이미 지불한 generation을 버리지 않고 제약을 맞출 가능성이 있다. 현재 52개 run에는 raw SDF가 저장되지 않았으므로 과거 결과를 그대로 remesh해 검증할 수는 없다. 다음 run부터 <code>--save-raw-sdf</code>를 켜고, 아래 세 항목을 측정해야 한다.</p>
+<ol>
+ <li>iso-level에 따른 체적의 단조성 및 목표 0.500 도달률</li>
+ <li>repair 전후 descriptor cell 유지율</li>
+ <li>repair 전후 watertightness, BC 연결, compliance 변화</li>
+</ol>
+
+<h2>Robust archive 규칙</h2>
+<p>최초 결과 하나는 provisional elite로 둔다. cell 경계 확률이 높거나 기존 elite를 교체할 가능성이 있는 후보만 추가 seed로 평가한다. elite 점수는 단일 최저 compliance가 아니라 seed 분포의 평균과 상위 위험분위수(예: 80% quantile)를 함께 기록한다. cell 소속 신뢰도와 체적 통과확률이 기준을 넘을 때 verified elite로 승격한다. 이는 모든 후보를 같은 횟수 반복하는 방식보다 예산을 논문 지표에 직접 배분한다.</p>
+
+<h2>구현 순서와 중단 기준</h2>
+<table><thead><tr><th>순서</th><th>구현/실험</th><th>통과 기준</th></tr></thead><tbody>
+<tr><td>0 · 완료</td><td>52개 retrospective 진단</td><td>단일-draw feasibility 실패와 sparse 전달성 확인</td></tr>
+<tr><td>1</td><td>raw SDF 저장 + iso-level bisection repair</td><td>repair 도달률 ≥80%, valid 유지 ≥90%, cell 유지 ≥75%</td></tr>
+<tr><td>2</td><td>exact heteroscedastic GP + leave-one-group-out calibration</td><td>체적구간 80/90% coverage 오차 ≤10%p, current volume MAE 0.0505보다 개선</td></tr>
+<tr><td>3</td><td>확률 제약 BOP-Elites acquisition</td><td>같은 replay/proxy budget에서 random보다 feasible archive gain 우세</td></tr>
+<tr><td>4</td><td>adaptive seed 재평가 + robust archive</td><td>고정 반복 대비 같은 seed 예산에서 잘못된 elite 교체 감소</td></tr>
+<tr class="defer"><td>5 · 보류</td><td>논문용 대규모 반복 실험</td><td>방법 고정 후 수행</td></tr>
+<tr class="defer"><td>6 · 보류</td><td>추가 3D domain 확장</td><td>Bracket에서 기전 확인 후 수행</td></tr>
+</tbody></table>
+<p class="small">기준값은 사전 pilot gate이며 결과를 보고 사후에 바꾸지 않도록 protocol에 고정한다.</p>
+
+<h2>연구상 기여로 정리되는 지점</h2>
+<p>새로움은 “생성모델에 QD를 적용했다”가 아니라, <b>확률적인 3D realization chain의 중간 geometry를 이용해 repair하고, 실제 구현 가능한 결과의 분포로 archive를 정의한다</b>는 데 있다. BOP-Elites의 descriptor uncertainty, uncertain-QD의 반복평가, constrained BO의 chance constraint가 각자 다루지 않은 sparse→final realization calibration을 연결한다.</p>
+
+<h2>근거 자료</h2>
+<ul class="refs">
+ <li><a href="https://arxiv.org/abs/2005.04320">BOP-Elites: Bayesian Optimization for Quality-Diversity Search</a></li>
+ <li><a href="https://arxiv.org/abs/2307.09326">BOP-Elites with black-box behavior descriptors</a></li>
+ <li><a href="https://arxiv.org/abs/2302.00463">Uncertain Quality-Diversity</a> — Archive-sampling, adaptive sampling, Deep-Grid 비교</li>
+ <li><a href="https://proceedings.mlr.press/v32/gardner14.html">Bayesian Optimization with Inequality Constraints</a></li>
+ <li><a href="https://proceedings.mlr.press/v162/inatsu22a.html">Distributionally Robust Chance-constrained Bayesian Optimization</a></li>
+ <li><a href="https://proceedings.mlr.press/v130/eriksson21a.html">Scalable Constrained Bayesian Optimization (SCBO)</a></li>
+ <li><a href="https://proceedings.mlr.press/v293/ascia25a.html">Feasibility-Driven Trust Region Bayesian Optimization</a></li>
+</ul>
+
+<h2>산출물 절대경로</h2>
+<p class="path">/home/goya/SDL/3d_qd/codebase/docs/raqd_v2_methodology_2026-09-13.html<br>
+/home/goya/SDL/3d_qd/codebase/analyze_raqd_methodology.py<br>
+/home/goya/SDL/3d_qd/experiments/bracket/raqd_online_2026-09-13/methodology_diagnostics.json<br>
+/home/goya/SDL/3d_qd/experiments/bracket/raqd_online_2026-09-13/methodology_diagnostics.png</p>
+</main></body></html>
