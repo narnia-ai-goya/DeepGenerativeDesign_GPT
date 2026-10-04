@@ -77,7 +77,9 @@ def build_mesh(domain_dir: str, mesh_size: float, out_msh: str):
 def run_fea(domain_dir: str, density_path: str, nodes_path: str, output_path: str,
             mesh_size: float = 0.006, mesh_cache: str = '/tmp/bracket_fea.msh',
             penal: float = 3.0, E0: float = 1.0, nu: float = 0.3,
-            load_magnitude: float = -5000.0, vtk_out: str = None, geom_out: str = None):
+            load_magnitude: float = -5000.0, vtk_out: str = None, geom_out: str = None,
+            second_load_stl: str = None, second_load_magnitude: float = 0.0,
+            second_load_mode: str = 'y'):
 
     # Load mesh — supports .msh (gmsh) or .npz (nodes+tets dict)
     if mesh_cache.endswith('.npz'):
@@ -137,7 +139,23 @@ def run_fea(domain_dir: str, density_path: str, nodes_path: str, output_path: st
     else:
         ext_nodes = np.load(nodes_path)
         tree = cKDTree(ext_nodes)
-        _, idx = tree.query(coords)
+        node_distance, idx = tree.query(coords)
+        # A nearest-neighbour transfer only represents the same density field
+        # when external voxel centers and FEM nodes share a coordinate frame.
+        # Without this guard a translated grid silently maps every FEM node to
+        # an unrelated boundary voxel, yielding finite but meaningless FEA
+        # sensitivities.  The threshold is deliberately configurable for
+        # coarser domains; bracket's valid mapping has p99 < 3 mm.
+        import os as _os_guard
+        max_node_map_distance = float(_os_guard.environ.get('FEA_MAX_NODE_MAP_DISTANCE', '0.02'))
+        p99_distance = float(np.percentile(node_distance, 99))
+        print(f'legacy voxel map: nearest distance median={np.median(node_distance)*1000:.3f}mm '
+              f'p99={p99_distance*1000:.3f}mm')
+        if p99_distance > max_node_map_distance:
+            raise ValueError(
+                f'external density nodes are not aligned to the FEA domain: '
+                f'p99 nearest distance={p99_distance*1000:.2f}mm exceeds '
+                f'FEA_MAX_NODE_MAP_DISTANCE={max_node_map_distance*1000:.2f}mm')
         node_density = np.clip(ext_density[idx], 1e-3, 1.0)
         elem_density = np.zeros(n_cells)
         for c in range(n_cells):
@@ -253,12 +271,57 @@ def run_fea(domain_dir: str, density_path: str, nodes_path: str, output_path: st
         fz_c = fem.Constant(domain, PETSc.ScalarType(f_mag * fz_r / norm_d))
         f = ufl.as_vector([fx_c * load_indicator, fy_c * load_indicator, fz_c * load_indicator])
         dir_desc = 'diag (1,-1,-1)/sqrt(3)'
+    if second_load_stl:
+        if second_load_mode not in ('x', '-x', 'y', '-y', 'z', '-z'):
+            raise ValueError(f'unsupported second load direction: {second_load_mode}')
+        second_mesh = trimesh.load(second_load_stl)
+        if os.environ.get('BC_SURFACE_DIST', '0') == '1':
+            from trimesh.proximity import closest_point
+            _, second_dist, _ = closest_point(second_mesh, coords)
+        else:
+            second_dist, _ = cKDTree(second_mesh.vertices).query(coords)
+        second_node_ids = np.where(second_dist < bc_dist)[0]
+        if len(second_node_ids) == 0:
+            raise ValueError(f'second load has no FEM nodes: {second_load_stl}')
+        second_indicator = fem.Function(W)
+        second_indicator.x.array[:] = 0.0
+        second_indicator.x.array[second_node_ids] = 1.0
+        second_area = fem.assemble_scalar(fem.form(second_indicator * ufl.dx))
+        if second_area <= 0:
+            raise ValueError(f'second load has zero integrated area: {second_load_stl}')
+        second_sign = -1.0 if second_load_mode.startswith('-') else 1.0
+        second_axis = {'x': 0, 'y': 1, 'z': 2}[second_load_mode[-1]]
+        second_force_density = abs(second_load_magnitude) / second_area
+        second_components = [
+            fem.Constant(domain, PETSc.ScalarType(
+                second_force_density * second_sign if k == second_axis else 0.0
+            )) * second_indicator for k in range(3)
+        ]
+        f = f + ufl.as_vector(second_components)
+        print(f'Load2: {len(second_node_ids)} nodes, load_area={second_area*1e6:.2f} cm³, '
+              f'total F={abs(second_load_magnitude):.0f} N, dir=axis {second_load_mode}')
+        print('Load combination: simultaneous (one displacement solve, f = load1 + load2)')
     L = ufl.dot(f, v_te) * ufl.dx
     print(f'Load: {len(load_node_ids)} nodes, load_area={load_area*1e6:.2f} cm³, total F={f_total:.0f} N, dir={dir_desc}')
 
     # Solve
-    problem = LinearProblem(a, L, bcs=[bc], petsc_options={'ksp_type': 'preonly', 'pc_type': 'lu'})
+    # Direct LU is robust for small meshes but becomes costly for refined chair
+    # domains. Allow an explicitly requested iterative PETSc configuration while
+    # preserving the original default for existing experiments.
+    ksp_type = os.environ.get('FEA_KSP_TYPE', 'preonly')
+    pc_type = os.environ.get('FEA_PC_TYPE', 'lu')
+    petsc_options = {'ksp_type': ksp_type, 'pc_type': pc_type}
+    if ksp_type != 'preonly':
+        petsc_options['ksp_rtol'] = os.environ.get('FEA_KSP_RTOL', '1e-8')
+        petsc_options['ksp_max_it'] = os.environ.get('FEA_KSP_MAX_IT', '2000')
+    problem = LinearProblem(a, L, bcs=[bc], petsc_options=petsc_options)
     uh = problem.solve()
+    reason = int(problem.solver.getConvergedReason())
+    if reason <= 0:
+        raise RuntimeError(f'PETSc solve did not converge: reason={reason}, '
+                           f'iterations={problem.solver.getIterationNumber()}')
+    print(f'PETSc solve: ksp={ksp_type}, pc={pc_type}, '
+          f'iterations={problem.solver.getIterationNumber()}, reason={reason}', flush=True)
 
     # paper ref: main text, compliance C = f^T u from the in-loop linear-elastic FEM solve.
     compliance = fem.assemble_scalar(fem.form(ufl.dot(f, uh) * ufl.dx))
@@ -402,6 +465,10 @@ if __name__ == '__main__':
     ap.add_argument('--nu', type=float, default=0.3)
     ap.add_argument('--load-magnitude', type=float, default=42300.0,
                     help='total force magnitude in N (default = 42300, a reference scale). In cube space mesh, smaller (e.g. 1.0) is more numerically stable.')
+    ap.add_argument('--second-load-stl', default=None,
+                    help='optional second load region STL, applied simultaneously in the same solve')
+    ap.add_argument('--second-load-magnitude', type=float, default=0.0)
+    ap.add_argument('--second-load-mode', default='y')
     ap.add_argument('--vtk-out', default=None,
                     help='write displacement + vm + E to .pvd (also creates _vm.pvd, _E.pvd)')
     ap.add_argument('--geom-out', default=None,
@@ -426,4 +493,7 @@ if __name__ == '__main__':
     run_fea(args.domain_dir, args.density, args.nodes, args.output,
             mesh_size=args.mesh_size, mesh_cache=args.mesh_cache,
             penal=args.penal, E0=args.E0, nu=args.nu,
-            load_magnitude=args.load_magnitude, vtk_out=args.vtk_out, geom_out=args.geom_out)
+            load_magnitude=args.load_magnitude, vtk_out=args.vtk_out, geom_out=args.geom_out,
+            second_load_stl=args.second_load_stl,
+            second_load_magnitude=args.second_load_magnitude,
+            second_load_mode=args.second_load_mode)

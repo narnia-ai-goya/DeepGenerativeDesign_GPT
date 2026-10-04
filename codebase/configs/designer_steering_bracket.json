@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "revision": 0,
+  "updated_at": "2026-09-22T00:00:00+00:00",
+  "archive_axes": {
+    "x": "normalized_mass",
+    "y": "semantic_shape_niche",
+    "cell_quality": "independent_FEA_performance"
+  },
+  "semantic_anchors": {
+    "continuous_load_path": 0.8,
+    "redundant_branching": 0.5,
+    "large_clear_openings": 0.4
+  },
+  "target_mass_range": [0.28, 0.62],
+  "target_cells": {},
+  "locked_candidates": [],
+  "rejected_candidates": [],
+  "local_exploration": [],
+  "designer_notes": [],
+  "hard_gates": {
+    "editable": false,
+    "owner": "automatic_evaluation_pipeline",
+    "checks": [
+      "boundary_condition_preservation",
+      "envelope_validity",
+      "single_connected_component",
+      "minimum_thickness",
+      "independent_FEA_acceptance"
+    ]
+  },
+  "interaction_log": []
+}

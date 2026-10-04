@@ -20,6 +20,8 @@ _D3DS2_ROOT = os.environ.get('D3DS2_ROOT') or os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(_D3DS2_ROOT, 'external', 'Direct3D-S2'))
 import argparse
+import json
+from contextlib import contextmanager
 from pathlib import Path
 import numpy as np
 import torch
@@ -31,6 +33,107 @@ from direct3d_s2.pipeline import Direct3DS2Pipeline
 from direct3d_s2.modules import sparse as sp
 from direct3d_s2.utils import sort_block, normalize_mesh, mesh2index
 from scipy.ndimage import binary_erosion
+from sparse_wall_ray_loss import prepare_side_fronts, sparse_side_front_loss
+from sparse_side_depth_loss import dense_side_depth_reference, sparse_side_depth_loss
+
+
+@contextmanager
+def temporary_fea_load(mode: str, magnitude: float):
+    """Select one synchronous FEniCS load case without leaking it to the next call."""
+    old_mode = os.environ.get('LOAD_MODE')
+    old_magnitude = os.environ.get('FEA_LOAD_MAGNITUDE')
+    os.environ['LOAD_MODE'] = str(mode)
+    os.environ['FEA_LOAD_MAGNITUDE'] = str(magnitude)
+    try:
+        yield
+    finally:
+        if old_mode is None:
+            os.environ.pop('LOAD_MODE', None)
+        else:
+            os.environ['LOAD_MODE'] = old_mode
+        if old_magnitude is None:
+            os.environ.pop('FEA_LOAD_MAGNITUDE', None)
+        else:
+            os.environ['FEA_LOAD_MAGNITUDE'] = old_magnitude
+
+
+def paired_fea_compliance(occ_logits, mask, nodes, seat_domain, back_domain,
+                          mesh_cache, mesh_size, penal, reference,
+                          back_mode='y', back_magnitude=200.0,
+                          bc_mask_np=None, verbose=False):
+    """Balanced seat/back compliance; keeps the single-load path unchanged."""
+    from fea_compliance_loss import fea_compliance_loss
+    seat = fea_compliance_loss(occ_logits, mask, nodes, seat_domain, mesh_cache,
+                               mesh_size=mesh_size, penal=penal,
+                               bc_mask_np=bc_mask_np, verbose=verbose)
+    if os.environ.get('FEA_SECOND_LOAD_STL'):
+        # Both physical forces were applied in this one FEA solve.
+        return seat, None, None
+    if not back_domain:
+        return seat, seat, None
+    with temporary_fea_load(back_mode, back_magnitude):
+        back = fea_compliance_loss(occ_logits, mask, nodes, back_domain, mesh_cache,
+                                   mesh_size=mesh_size, penal=penal,
+                                   bc_mask_np=bc_mask_np, verbose=verbose)
+    if not torch.isfinite(seat).item() or not torch.isfinite(back).item():
+        raise ValueError(f'non-finite paired FEA: seat={seat.item()} back={back.item()}')
+    if reference.get('back_scale') is None:
+        # Scale the backrest's initial compliance to the seat's initial value.
+        # The resulting objective has the same magnitude as the old seat-only
+        # objective, while both load cases receive equal initial importance.
+        reference['back_scale'] = float((seat.detach() / back.detach()).item())
+        print(f'  [dual FEA] initial back scale={reference["back_scale"]:.6g} '
+              f'(seat={seat.item():.4e}, back={back.item():.4e})', flush=True)
+    combined = .5 * (seat + reference['back_scale'] * back)
+    return combined, seat, back
+
+
+def fea_nodes_in_domain_frame(nodes: np.ndarray, alignment_path: str | None,
+                              label: str) -> np.ndarray:
+    """Map generation-grid nodes into the physical FEA-domain frame.
+
+    Some legacy bracket recipes decode in an anisotropically aligned ``dense``
+    frame but solve FEA on the original physical CAD frame.  Density values stay
+    in their original voxel order; only their world coordinates supplied to the
+    FEA nearest-node transfer need the inverse affine map.
+    """
+    if not alignment_path:
+        return nodes
+    path = Path(alignment_path)
+    payload = json.loads(path.read_text())
+    registration = payload.get('native_frame_registration') or payload.get('rigid_uniform')
+    if registration:
+        # The chair generator's registered native frame differs from its physical
+        # FEM domain by a rotation and uniform scale. Mapping the voxel *nodes*
+        # (not reordering the density array) keeps the sparse-grid gradient in
+        # native coordinates while transferring material to physical FEM cells.
+        from scipy.spatial.transform import Rotation
+        source = np.asarray(registration['source_center_m'], dtype=np.float64)
+        physical = np.asarray(registration['physical_center_m'], dtype=np.float64)
+        scale = float(registration['uniform_scale'])
+        angle = float(registration['rotation_x_degrees'])
+        if source.shape != (3,) or physical.shape != (3,) or scale <= 0:
+            raise ValueError(f'invalid native-frame registration in {path}')
+        rotation = Rotation.from_euler('x', angle, degrees=True).as_matrix()
+        transformed = ((np.asarray(nodes, dtype=np.float64) - source) @ rotation.T *
+                       scale + physical)
+        print(f'  [FEA frame] {label}: rigid registration {path.name}; '
+              f'bbox mm {transformed.min(axis=0)*1000} → {transformed.max(axis=0)*1000}',
+              flush=True)
+        return transformed
+    affine = payload.get("affine_forward")
+    if not affine:
+        raise ValueError(f"{path} has no affine_forward mapping")
+    src = np.asarray(affine["src_min"], dtype=np.float64)
+    dst = np.asarray(affine["dst_min"], dtype=np.float64)
+    scale = np.asarray(affine["scale"], dtype=np.float64)
+    if src.shape != (3,) or dst.shape != (3,) or scale.shape != (3,) or np.any(scale <= 0):
+        raise ValueError(f"invalid affine_forward in {path}")
+    transformed = (np.asarray(nodes, dtype=np.float64) - dst) / scale + src
+    print(f"  [FEA frame] {label}: inverse affine {path.name}; "
+          f"bbox mm {transformed.min(axis=0)*1000} → {transformed.max(axis=0)*1000}",
+          flush=True)
+    return transformed
 
 
 # ============== Sparse GuideFlow3D-style guidance helpers (soft + anneal) ==============
@@ -1337,6 +1440,8 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
                   fea_w=0.0, fea_every_n=5, fea_warmup=0.3,
                   fea_domain_dir=None, fea_nodes=None, fea_mesh_cache='/tmp/bracket_fea.msh',
                   fea_mesh_size=0.006, fea_penal=3.0,
+                  fea_back_domain_dir=None, fea_back_load_mode='y',
+                  fea_back_load_magnitude=200.0,
                   fea_mesh_size_fine=None, fea_mesh_cache_fine='/tmp/bracket_fea_fine.msh',
                   fea_fine_warmup=0.8,
                   snapshot_every=0, snapshot_dir=None,
@@ -1345,7 +1450,17 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
                   dense_opt='flowdps', dense_lr=5e-3, grad_normalize=True,
                   shape_qd_archive=None, shape_qd_target=-1, shape_qd_w=0.0,
                   shape_qd_warmup=0.35, shape_anchor_bank=None, shape_anchor_w=0.0,
-                  shape_scaffold_w=0.0, shape_scaffold_pool=4):
+                  shape_scaffold_w=0.0, shape_scaffold_pool=4,
+                  shape_residual_w=0.0, shape_residual_pool=4,
+                  shape_residual_delta=0.15, shape_residual_neutral_w=0.05,
+                  shape_transport_radius=0.0, shape_transport_dims=2,
+                  shape_transport_ridge=1e-3, shape_transport_max_rel=0.05,
+                  shape_transport_every=5, shape_transport_max_updates=1,
+                  image_proj_target=None, image_proj_w=0.0, image_proj_warmup=0.35,
+                  oc_flow_w=0.0, oc_flow_warmup=0.35,
+                  oc_flow_max_rel=0.5,
+                  env_excess_w=0.0, env_excess_tol=0.002,
+                  dense_token_policy='legacy'):
     """Dense stage with FlowDPS gradient guidance.
 
     Core 3-region BCE:
@@ -1365,6 +1480,7 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
 
     Returns: latent_index for next stage (sparse512).
     """
+    dual_fea_reference = {}
     device = pipe.device
     vae = pipe.dense_vae
     dit = pipe.dense_dit
@@ -1391,6 +1507,14 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
     # The dense decoder produces 64^3 occupancy.
     R = 64
     bracket_t = torch.from_numpy(bracket_mask.astype(np.float32)).to(device)
+    image_projection = None
+    if image_proj_w > 0:
+        if not image_proj_target:
+            raise ValueError('image projection guidance needs --image-proj-target')
+        from image_projection_loss import ImageProjectionLoss
+        image_projection = ImageProjectionLoss(image_proj_target, device, mc_threshold)
+        print(f"  image projection: target={image_proj_target} w={image_proj_w} "
+              f"warmup={image_proj_warmup}", flush=True)
     shape_qd = None
     if shape_qd_w > 0:
         if not shape_qd_archive or shape_qd_target < 0:
@@ -1412,11 +1536,57 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
         from shape_qd_loss import MacroShapeScaffold
         shape_scaffold = MacroShapeScaffold(shape_anchor_bank, shape_qd_target, device, shape_scaffold_pool)
         print(f"  Shape scaffold: target niche={shape_qd_target} w={shape_scaffold_w} pool={shape_scaffold_pool}")
+    shape_residual = None
+    if shape_residual_w > 0:
+        if not shape_anchor_bank or shape_qd_target < 0:
+            raise ValueError('shape residual needs --shape-anchor-bank and --shape-qd-target')
+        from shape_qd_loss import ContrastiveMacroMorphology
+        shape_residual = ContrastiveMacroMorphology(
+            shape_anchor_bank, shape_qd_target, device, shape_residual_pool,
+            shape_residual_delta, shape_residual_neutral_w)
+        print(f"  Shape residual: target niche={shape_qd_target} w={shape_residual_w} "
+              f"pool={shape_residual_pool} delta={shape_residual_delta}")
+    shape_transport = None
+    if shape_transport_radius > 0:
+        if not shape_qd_archive or shape_qd_target < 0:
+            raise ValueError('shape transport needs --shape-qd-archive and --shape-qd-target')
+        if dense_opt != 'flowdps':
+            raise ValueError('shape transport currently requires --dense-opt flowdps')
+        if shape_transport_every < 1 or shape_transport_max_updates < 1:
+            raise ValueError('shape transport interval and update count must be positive')
+        from shape_qd_loss import LocalPcaTransport
+        shape_transport = LocalPcaTransport(
+            shape_qd_archive, shape_qd_target, device, shape_transport_dims,
+            shape_transport_radius, shape_transport_ridge, shape_transport_max_rel)
+        print(f"  Shape transport: target niche={shape_qd_target} dims={shape_transport_dims} "
+              f"radius={shape_transport_radius} max_rel={shape_transport_max_rel} "
+              f"every={shape_transport_every} max_updates={shape_transport_max_updates}")
+    # OC-Flow-style controller: do not perturb z after the model velocity has
+    # already been evaluated.  Instead, turn the differentiable structural loss
+    # into a bounded correction of that velocity before the Euler scheduler step.
+    # For z_next = z + (sigma_next-sigma) * v and sigma_next-sigma < 0 during
+    # denoising, adding +grad(L) to v moves z_next in -grad(L), as desired.
+    oc_flow_active = oc_flow_w > 0
+    if oc_flow_active:
+        if dense_opt != 'flowdps':
+            raise ValueError('--oc-flow-w currently requires --dense-opt flowdps')
+        if not 0.0 <= oc_flow_warmup <= 1.0:
+            raise ValueError('--oc-flow-warmup must be in [0, 1]')
+        if oc_flow_max_rel <= 0:
+            raise ValueError('--oc-flow-max-rel must be positive')
+        if shape_transport is not None:
+            raise ValueError('OC-Flow and shape transport cannot be enabled together')
+        print(f"  OC-Flow velocity control: w={oc_flow_w} warmup={oc_flow_warmup} "
+              f"max_rel={oc_flow_max_rel} (one loss-gradient per flow step)")
     design_t = torch.from_numpy(design_mask.astype(np.float32)).to(device)
     bc_t = torch.from_numpy(bc_mask.astype(np.float32)).to(device)
     out_t = 1.0 - bracket_t
     n_bc = bc_t.sum().clamp_min(1.0); n_out = out_t.sum().clamp_min(1.0); n_des = design_t.sum().clamp_min(1.0)
     n_bracket = bracket_t.sum().clamp_min(1.0)   # envelope total voxel count (BC + design)
+    if env_excess_w < 0 or not 0 <= env_excess_tol < 1:
+        raise ValueError('envelope excess weight/tolerance must be nonnegative and tolerance < 1')
+    if dense_token_policy not in ('legacy', 'raw'):
+        raise ValueError('dense_token_policy must be legacy or raw')
 
     # Engineering extras
     if pw > 0 and load_path_mask is not None:
@@ -1460,6 +1630,7 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
         t_now = float(t.item()) / 1000.0  # FlowMatch t is in [0, 1000] typically
         t_inf = torch.tensor([t.item()], dtype=latents.dtype, device=device)
         _last_vol_loss = None   # set in inner loop when vw>0, written to CSV at outer step
+        _env_ratio_last = None
 
         # Sync latents ←→ z_param at outer-step entry when in GuideFlow mode.
         if z_param is not None:
@@ -1471,9 +1642,13 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
             noise_pred_u = dit(x=latents, t=t_inf, cond=uncond)
             noise_pred = noise_pred_u + guidance_scale * (noise_pred_c - noise_pred_u)
 
-        # FlowDPS gradient via dense decoder occupancy
+        # FlowDPS gradient via dense decoder occupancy.  OC-Flow evaluates one
+        # gradient only: repeated inner iterations would see identical latents
+        # because it intentionally delays the update until scheduler.step().
         _vanilla = os.environ.get('VANILLA', '0') == '1'
-        for inner in range(0 if _vanilla else inner_steps):
+        _guidance_inner_steps = 1 if oc_flow_active else inner_steps
+        _oc_grad = None
+        for inner in range(0 if _vanilla else _guidance_inner_steps):
             # In GuideFlow mode, z_param itself is the leaf; in FlowDPS mode,
             # z_in is a fresh leaf each inner step.
             if z_param is not None:
@@ -1538,6 +1713,13 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
                 loss = (out_w * (bce_empty * out_t).sum() / n_out
                         + bc_w * (bce_solid * bc_t).sum() / n_bc
                         + dw * (bce_solid * design_t).sum() / n_des)
+                if env_excess_w > 0:
+                    # One-sided envelope constraint: do not penalize sub-threshold
+                    # probability or a sample that is already within tolerance.
+                    _excess_occ = (torch.sigmoid(occ_logits) - mc_threshold).clamp_min(0.0)
+                    _env_ratio = (_excess_occ * out_t).sum() / _excess_occ.sum().clamp_min(1.0)
+                    loss = loss + env_excess_w * (_env_ratio - env_excess_tol).clamp_min(0.0).square()
+                    _env_ratio_last = float(_env_ratio.detach())
 
                 # Engineering extras
                 if vol_projection:
@@ -1592,6 +1774,12 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
                     loss = loss + pw * (bce_solid * lp_t).sum() / n_lp
                 # Warm-up: connectivity/thinness only after first half (x̂_0 reliable)
                 step_frac = i / max(1, len(timesteps) - 1)  # 0 → 1 over denoising
+                if image_projection is not None and step_frac >= image_proj_warmup:
+                    _image_projection_loss = image_projection.loss(occ_logits, bracket_t)
+                    loss = loss + image_proj_w * _image_projection_loss
+                    if inner == 0 and i % max(1, len(timesteps)//5) == 0:
+                        print(f"    image projection @ step {i}: loss={_image_projection_loss.item():.4f}",
+                              flush=True)
                 if shape_qd is not None and step_frac >= shape_qd_warmup:
                     _shape_loss, _shape_z = shape_qd.loss(occ_logits, bc_t)
                     loss = loss + shape_qd_w * _shape_loss
@@ -1607,6 +1795,33 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
                     loss = loss + shape_scaffold_w * _scaffold_loss
                     if i % max(1, len(timesteps)//5) == 0:
                         print(f"    Shape scaffold @ step {i}: loss={_scaffold_loss.item():.4f}")
+                if shape_residual is not None and step_frac >= shape_qd_warmup:
+                    if shape_residual.reference is None:
+                        _cells = shape_residual.prepare(occ_logits, bc_t)
+                        print(f"    Shape residual reference @ step {i}: "
+                              f"add={_cells['add_cells']} remove={_cells['remove_cells']} "
+                              f"neutral={_cells['neutral_cells']}")
+                    _residual_loss = shape_residual.loss(occ_logits, bc_t)
+                    loss = loss + shape_residual_w * _residual_loss
+                    if i % max(1, len(timesteps)//5) == 0:
+                        print(f"    Shape residual @ step {i}: loss={_residual_loss.item():.4f}")
+                if (shape_transport is not None and step_frac >= shape_qd_warmup
+                        and shape_transport.updates < shape_transport_max_updates
+                        and (i - int(np.ceil(shape_qd_warmup * max(1, len(timesteps) - 1)))) % shape_transport_every == 0):
+                    _transport_z, _transport_info = shape_transport.step(
+                        z_in, shape_transport.embedding(torch.sigmoid(occ_logits), bc_t))
+                    with torch.no_grad():
+                        if z_param is None:
+                            latents = latents + _transport_z.to(latents.dtype)
+                        else:
+                            z_param.add_(_transport_z.to(z_param.dtype))
+                            latents = z_param.detach().to(pipe.dtype)
+                    shape_transport.updates += 1
+                    print(f"    Shape transport {shape_transport.updates}/{shape_transport_max_updates} @ step {i}: "
+                          f"requested={_transport_info['requested_norm']:.4f} "
+                          f"predicted={_transport_info['predicted_norm']:.4f} "
+                          f"latent_step={_transport_info['latent_norm']:.4f} "
+                          f"clipped={_transport_info['clipped']}")
                 _last_thin = _last_thick_hard = _last_thick_soft = _last_rmin = _last_reach = None
                 _last_bce = float(loss.item())   # core BCE total (out_w+bc_w+dw, before extras)
                 if cw > 0 and step_frac > cw_warmup:
@@ -1647,10 +1862,13 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
                             m_size = fea_mesh_size
                             m_cache = fea_mesh_cache
                             stage = 'coarse'
-                        comp = fea_compliance_loss(
+                        comp, seat_comp, back_comp = paired_fea_compliance(
                             occ_logits, bracket_mask, fea_nodes,
-                            fea_domain_dir, m_cache,
+                            fea_domain_dir, fea_back_domain_dir, m_cache,
                             mesh_size=m_size, penal=fea_penal,
+                            reference=dual_fea_reference,
+                            back_mode=fea_back_load_mode,
+                            back_magnitude=fea_back_load_magnitude,
                             verbose=(i % (fea_every_n*2) == 0))
                         # normalize: magnitude=1, sign+direction only (raw comp 1e10+ causes NaN cascade)
                         # FEA_NORMALIZE env var: '1' (default) = normalize on, '0' = raw
@@ -1661,6 +1879,12 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
                             comp_normed = comp / (comp.detach().abs() + 1e-12)
                             loss = loss + fea_w * comp_normed
                         fea_comp_this_step = float(comp.item())
+                        if back_comp is not None:
+                            print(f"    [dense dual FEA step {i}] "
+                                  f"seat={seat_comp.item():.4e} back={back_comp.item():.4e} "
+                                  f"balanced={comp.item():.4e}", flush=True)
+                        elif os.environ.get('FEA_SECOND_LOAD_STL'):
+                            print(f"    [dense simultaneous FEA step {i}] C={comp.item():.4e}", flush=True)
                         if i % (fea_every_n*2) == 0:
                             print(f"    FEA compliance @ step {i} [{stage} mesh_size={m_size*1000:.1f}mm]: C={comp.item():.4e}  (fea_w={fea_w})")
                     except Exception as e:
@@ -1673,10 +1897,17 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
                 with torch.no_grad():
                     if grad_normalize:
                         grad_norm = grad.flatten().norm() + 1e-8
-                        latents = latents - (eta / num_inference_steps / inner_steps) * grad / grad_norm
+                        if oc_flow_active:
+                            # Kept for velocity construction below; no direct z edit.
+                            _oc_grad = grad.detach()
+                        else:
+                            latents = latents - (eta / num_inference_steps / inner_steps) * grad / grad_norm
                     else:
                         # Magnitude-aware step (no normalize): step ∝ ‖grad‖. May explode if loss big.
-                        latents = latents - (eta / num_inference_steps / inner_steps) * grad
+                        if oc_flow_active:
+                            _oc_grad = grad.detach()
+                        else:
+                            latents = latents - (eta / num_inference_steps / inner_steps) * grad
             else:
                 # GuideFlow-style: Adam/SGD update on z_param (persistent state)
                 loss.backward()
@@ -1729,12 +1960,32 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
             except Exception as _e:
                 print(f"    [WARN] snapshot at step {i} failed: {_e}")
 
-        # Standard flow step (Euler) — applies to whichever latent source is active
+        # Standard flow step (Euler), with an optional OC-Flow correction applied
+        # to the velocity itself.  This makes the structural objective part of the
+        # sampler dynamics, unlike post-hoc latent transport that the remaining
+        # flow can immediately undo.
+        flow_velocity = noise_pred
+        _oc_step_frac = i / max(1, len(timesteps) - 1)
+        if oc_flow_active and _oc_step_frac >= oc_flow_warmup and _oc_grad is not None:
+            with torch.no_grad():
+                _g = _oc_grad.to(noise_pred.dtype)
+                _g_norm = _g.flatten(1).norm(dim=1, keepdim=True).clamp_min(1e-8)
+                _g_unit = _g / _g_norm.reshape((-1,) + (1,) * (_g.ndim - 1))
+                _corr = float(oc_flow_w) * _g_unit
+                _v_norm = noise_pred.flatten(1).norm(dim=1, keepdim=True).clamp_min(1e-8)
+                _corr_norm = _corr.flatten(1).norm(dim=1, keepdim=True).clamp_min(1e-8)
+                _cap = float(oc_flow_max_rel) * _v_norm
+                _scale = torch.minimum(torch.ones_like(_corr_norm), _cap / _corr_norm)
+                _corr = _corr * _scale.reshape((-1,) + (1,) * (_corr.ndim - 1))
+                flow_velocity = noise_pred + _corr
+                if i % max(1, len(timesteps)//5) == 0:
+                    print(f"    OC-Flow @ step {i}: |corr|/|v|="
+                          f"{float((_corr.flatten(1).norm(dim=1) / _v_norm.squeeze(1)).mean()):.3f}")
         if z_param is None:
-            latents = scheduler.step(noise_pred, t, latents).prev_sample
+            latents = scheduler.step(flow_velocity, t, latents).prev_sample
         else:
             with torch.no_grad():
-                new_latents = scheduler.step(noise_pred, t, z_param.detach().to(pipe.dtype)).prev_sample
+                new_latents = scheduler.step(flow_velocity, t, z_param.detach().to(pipe.dtype)).prev_sample
             z_param.data = new_latents.to(torch.float32)
             latents = z_param.detach().to(pipe.dtype)
 
@@ -1763,7 +2014,8 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
                 print(f"  step {i+1}/{num_inference_steps}: t={t_now:.3f} (vanilla)  cuda {torch.cuda.memory_allocated()/1e9:.1f}GB")
             else:
                 _vol_print = '' if _last_vol_loss is None else f' vol={_last_vol_loss:.5f}'
-                print(f"  step {i+1}/{num_inference_steps}: t={t_now:.3f} loss={loss.item():.5f}{_vol_print}  cuda {torch.cuda.memory_allocated()/1e9:.1f}GB")
+                _env_print = '' if _env_ratio_last is None else f' env_excess={_env_ratio_last:.5f}'
+                print(f"  step {i+1}/{num_inference_steps}: t={t_now:.3f} loss={loss.item():.5f}{_vol_print}{_env_print}  cuda {torch.cuda.memory_allocated()/1e9:.1f}GB")
 
     # Unscale latents for decoding
     latents = 1. / latents_scale * latents + latents_shift
@@ -1777,6 +2029,9 @@ def dense_flowdps(pipe, image, bracket_mask, design_mask, bc_mask,
     idx_np = index.cpu().numpy()
     # stash the PRE-FILTER token set so main can save mesh_dense_raw.obj
     dense_flowdps._prefilter_idx = idx_np.copy()
+    if dense_token_policy == 'raw':
+        print(f"dense index (raw policy — no envelope token filter or BC injection): {index.shape}")
+        return index
     if os.environ.get('VANILLA', '0') == '1':
         # Pure Direct3D-S2 baseline: image conditioning only — no BC token
         # injection, no bracket filter. Set env VANILLA=1.
@@ -1833,6 +2088,43 @@ def main():
     ap.add_argument("--sdf-resolution", type=int, default=512)
     ap.add_argument("--mc-threshold", type=float, default=0.2,
                     help="sparse marching-cubes threshold; lower = inflated surface (less tear)")
+    ap.add_argument("--sp-sdf-guidance-threshold", type=float, default=None,
+                    help="iso value used by sparse SDF/occupancy/FEA guidance; default keeps legacy mc_threshold. "
+                         "Set to 2*mc_threshold to compare against the pre-refiner extraction iso.")
+    ap.add_argument("--sp-sdf-inside-low", action="store_true",
+                    help="treat sparse SDF values below the guidance iso as solid, matching "
+                         "sparse2mesh/refiner marching cubes; default preserves legacy guidance")
+    ap.add_argument("--sp-dense-core-mm", type=float, default=0.0,
+                    help="protect material more than this distance inside the dense 3D mesh "
+                         "throughout sparse guidance and at sparse decoding; 0 disables")
+    ap.add_argument("--sp-dense-core-w", type=float, default=0.0,
+                    help="sparse guidance loss weight for violating the dense 3D material core")
+    ap.add_argument("--sp-dense-core-tail-frac", type=float, default=0.0,
+                    help="if >0, optimize the worst fraction of dense-core violations "
+                         "(CVaR) instead of their mean; 0 keeps mean loss")
+    ap.add_argument("--sp-dense-core-project", action="store_true",
+                    help="diagnostic hard projection of the dense core on the final sparse SDF; "
+                         "can introduce discontinuities, so keep disabled for loss-only guidance")
+    ap.add_argument("--sp-wall-ray-w", type=float, default=0.0,
+                    help="guide sparse SDF to retain the first visible material on both X side views")
+    ap.add_argument("--sp-wall-ray-band", type=int, default=4,
+                    help="512-grid samples supervised inward from each dense-support side face")
+    ap.add_argument("--sp-wall-ray-min-mass", type=float, default=2.0,
+                    help="minimum soft solid count in the side-view front band")
+    ap.add_argument("--sp-wall-ray-tail-frac", type=float, default=0.0,
+                    help="if positive, blend mean front-ray loss with worst fraction of rays")
+    ap.add_argument("--sp-side-depth-w", type=float, default=0.0,
+                    help="sparse guidance loss for excessive side-view first-hit recession vs dense mesh")
+    ap.add_argument("--sp-side-depth-tolerance-mm", type=float, default=4.0,
+                    help="allowed side-surface recession from dense reference before penalty")
+    ap.add_argument("--sp-side-depth-tail-frac", type=float, default=0.0,
+                    help="if positive, blend mean side-depth loss with worst fraction of rays")
+    ap.add_argument("--sp-dense-trust-mm", type=float, default=0.0,
+                    help="continuous 3D field constraint before sparse/refiner marching cubes: "
+                         "the generated field must remain solid farther than this distance "
+                         "inside the dense mesh; 0 disables")
+    ap.add_argument("--sp-dense-trust-scale", type=float, default=40.0,
+                    help="SDF-field slope per meter for the dense 3D trust constraint")
     ap.add_argument("--bce-boundary", type=float, default=None,
                     help="implicit decision boundary of the dense 3-region BCE EMPTY term (logit "
                          "shift by logit(τ); solid terms stay standard). Default None = AUTO: "
@@ -1849,6 +2141,9 @@ def main():
                          "Raise toward 0.5 for a tighter token set, lower for more headroom.")
     ap.add_argument("--thin-expand-vox", type=int, default=0,
                     help="thin-region selective index expansion before sparse stage (N voxel dilation)")
+    ap.add_argument("--sp-support-halo-vox", type=int, default=0,
+                    help="add this many 64-grid exterior token layers for sparse decoding only; "
+                         "keep the original dense support as the topology target (0 disables)")
     ap.add_argument("--thin-thresh-vox", type=int, default=1,
                     help="EDT half-thickness threshold (vox) for identifying 'thin' solid")
     ap.add_argument("--fea-stress-expand", action='store_true',
@@ -1863,6 +2158,12 @@ def main():
     ap.add_argument("--eta", type=float, default=300.0)
     ap.add_argument("--bc-w", type=float, default=3.0)
     ap.add_argument("--out-w", type=float, default=10.0)
+    ap.add_argument("--env-excess-w", type=float, default=0.0,
+                    help="one-sided dense envelope excess loss; zero for already-feasible occupancy")
+    ap.add_argument("--env-excess-tol", type=float, default=0.002,
+                    help="allowed fraction of above-threshold occupancy outside the envelope")
+    ap.add_argument("--dense-token-policy", choices=["legacy", "raw"], default="legacy",
+                    help="raw keeps decoded dense tokens without envelope filtering or BC injection")
     ap.add_argument("--dw", type=float, default=0.0,
                     help="design region 'force solid' weight. 0=cond decides freely (hole/lattice possible), "
                          "0.3+=strongly push the design region to solid (porous hard to express)")
@@ -1872,6 +2173,12 @@ def main():
                     help="CVT niche index in --shape-qd-archive; activates direct shape targeting with --shape-qd-w")
     ap.add_argument("--shape-qd-w", type=float, default=0.0,
                     help="dense-stage frozen shape-PCA target loss weight")
+    ap.add_argument("--image-proj-target", default=None,
+                    help="64x64 BC-registered top-image target NPZ with target and weight arrays")
+    ap.add_argument("--image-proj-w", type=float, default=0.0,
+                    help="training-free dense top-projection image loss weight; 0=off")
+    ap.add_argument("--image-proj-warmup", type=float, default=0.35,
+                    help="fraction of dense denoising before image projection guidance starts")
     ap.add_argument("--shape-anchor-bank", default=None,
                     help="valid_shape_prototypes.npz for direct multi-scale geometry anchoring")
     ap.add_argument("--shape-anchor-w", type=float, default=0.0,
@@ -1880,8 +2187,43 @@ def main():
                     help="dense-stage coarse morphology scaffold BCE weight")
     ap.add_argument("--shape-scaffold-pool", type=int, default=4,
                     help="64³-to-macro pool factor for scaffold guidance")
+    ap.add_argument("--shape-residual-w", type=float, default=0.0,
+                    help="dense-stage contrastive macro morphology weight; acts only where target differs from the warm-up dense prior")
+    ap.add_argument("--shape-residual-pool", type=int, default=4,
+                    help="64³-to-macro pooling for contrastive residual morphology")
+    ap.add_argument("--shape-residual-delta", type=float, default=0.15,
+                    help="minimum target-minus-prior macro occupancy gap that defines a shape addition/removal")
+    ap.add_argument("--shape-residual-neutral-w", type=float, default=0.05,
+                    help="weak dense-prior retention weight outside contrastive target cells")
+    ap.add_argument("--shape-transport-radius", type=float, default=0.0,
+                    help="one-shot dense local-PCA phenotype displacement at shape warm-up; 0 disables")
+    ap.add_argument("--shape-transport-dims", type=int, default=2,
+                    help="number of frozen PCA descriptor coordinates used by local transport")
+    ap.add_argument("--shape-transport-ridge", type=float, default=1e-3,
+                    help="Tikhonov ridge for the local descriptor Jacobian pseudo-inverse")
+    ap.add_argument("--shape-transport-max-rel", type=float, default=0.05,
+                    help="maximum one-shot transport norm relative to current dense latent norm")
+    ap.add_argument("--shape-transport-every", type=int, default=5,
+                    help="dense denoising-step interval between local transport relinearizations")
+    ap.add_argument("--shape-transport-max-updates", type=int, default=1,
+                    help="maximum number of local transport updates in the dense stage")
+    ap.add_argument("--oc-flow-w", type=float, default=0.0,
+                    help="training-free OC-Flow dense velocity-control strength; 0=off. Uses the existing "
+                         "differentiable structural loss before the Euler update instead of editing z directly")
+    ap.add_argument("--oc-flow-warmup", type=float, default=0.35,
+                    help="fraction of dense denoising before OC-Flow control activates (0..1)")
+    ap.add_argument("--oc-flow-max-rel", type=float, default=0.5,
+                    help="cap OC-Flow correction norm relative to model velocity norm per sample")
     ap.add_argument("--sp-shape-anchor-w", type=float, default=0.0,
                     help="sparse-stage multi-scale geometry anchor weight")
+    ap.add_argument("--sp-image-proj-w", type=float, default=0.0,
+                    help="sparse-stage camera-aligned image silhouette guidance on the decoded 64³ occupancy; "
+                         "uses --image-proj-target, 0 disables")
+    ap.add_argument("--sp-negative-space-mask", default=None,
+                    help="optional NPZ containing a 64³ boolean mask of image-derived empty-space rays; "
+                         "sparse decoder SDF is penalized directly inside this mask")
+    ap.add_argument("--sp-negative-space-w", type=float, default=0.0,
+                    help="direct sparse-stage empty-space BCE weight; 0 disables")
     ap.add_argument("--shape-anchor-expand-vox", type=int, default=0,
                     help="dilate target prototype support by this many 64³ voxels before sparse refinement")
     ap.add_argument("--shape-anchor-max-added", type=int, default=1500,
@@ -1901,6 +2243,12 @@ def main():
                     help="if set, intercept the final MC call and dump its input volume "
                          "as <path>.npz (sdf, grid_size, mc_threshold, env_origin, env_pitch). "
                          "Lets downstream tooling run SDF-level boolean union without re-MC.")
+    ap.add_argument("--sp-sdf-smooth-sigma", type=float, default=0.0,
+                    help="Gaussian smooth the 512-grid sparse SDF before final marching cubes; "
+                         "sigma is in 512-grid voxels (0 disables)")
+    ap.add_argument("--sp-sdf-smooth-volume-match", action="store_true",
+                    help="after sparse SDF smoothing, shift its iso field to preserve the "
+                         "pre-smoothing occupied-grid fraction")
     ap.add_argument("--posthoc-fea-steps", type=int, default=0,
                     help="PhysiOpt-style post-hoc baseline: AFTER sparse sampling finishes, run N "
                          "ADAM steps on the final sparse latent with FEM compliance + volume "
@@ -1963,6 +2311,14 @@ def main():
                     help="r_min radius in voxels for dense_rmin_filter_loss")
     ap.add_argument("--skip-sparse", action="store_true",
                     help="dense-only run: exit after dense stage (mesh.obj = mesh_dense.obj copy)")
+    ap.add_argument("--dense-keep-bc-components", action="store_true",
+                    help="hard dense-stage cleanup: keep only 6-connected active-token components that "
+                         "touch fixed/load BC. Removes detached dense debris before sparse refinement; "
+                         "does not bridge disconnected BCs, so use with --cw for an actual path constraint.")
+    ap.add_argument("--dense-keep-largest-mesh-component", action="store_true",
+                    help="after dense marching cubes, export only the largest connected mesh component. "
+                         "Use with --dense-keep-bc-components and --cw when MC creates tiny detached "
+                         "surface debris inside an otherwise BC-anchored token component.")
     ap.add_argument("--no-grad-normalize", action="store_true",
                     help="disable FlowDPS gradient normalization (magnitude-aware step). May explode.")
     ap.add_argument("--save-dense-cache", type=str, default=None,
@@ -1999,8 +2355,20 @@ def main():
                     help="fraction of denoising before FEA activates (0=always)")
     ap.add_argument("--fea-domain-dir", default=None,
                     help="dir with original_DesignSpace.stl, fixed.stl, load.stl")
+    ap.add_argument("--fea-back-domain-dir", default=None,
+                    help="optional second FEA domain for backrest load; enables balanced seat/back FEA in dense and sparse")
+    ap.add_argument("--fea-back-load-mode", default='y',
+                    help="direction for the optional backrest FEA load")
+    ap.add_argument("--fea-back-load-magnitude", type=float, default=200.0,
+                    help="magnitude in N for the optional backrest FEA load")
+    ap.add_argument("--fea-combine-loads", action='store_true',
+                    help="apply seat and backrest forces simultaneously in one FEA solve")
     ap.add_argument("--fea-bracket-stl", default=None,
                     help="STL for voxel center origin (defaults to fea_domain_dir/original_DesignSpace.stl)")
+    ap.add_argument("--fea-node-alignment", default=None,
+                    help="alignment.json whose inverse affine maps generation-grid nodes into "
+                         "the physical --fea-domain-dir frame; required when the generation "
+                         "grid uses a legacy dense-aligned frame")
     ap.add_argument("--load-mode", default=None,
                     help="in-loop FEM load direction, exported to the FEA subprocess as LOAD_MODE: "
                          "x|-x|y|-y|z|-z (axis-aligned), or diag ((1,-1,-1)/sqrt(3), the solver's "
@@ -2255,12 +2623,18 @@ def main():
                     help="hard-force BC (fix∪load) region solid on every refiner/sparse SDF→MC "
                          "(≥256³) AND in the sparse guidance/FEA loop — BC region always filled, "
                          "as a default (not an optimization loss). Uses fix/load STL SDFs (smooth).")
+    ap.add_argument("--force-bc-fix-only", action="store_true",
+                    help="with --force-bc-solid, hard-force only the fixed STL; retain load "
+                         "interfaces through sparse soft guidance and the unmodified refiner surface")
     ap.add_argument("--force-bc-sdf-scale", type=float, default=40.0,
                     help="SDF→refiner mapping slope K (refiner_sdf = level - K·d). Higher = sharper "
                          "peg/envelope boundary. Continuous blend (no voxel staircase).")
     ap.add_argument("--force-bc-dilate-mm", type=float, default=6.0,
                     help="inflate the BC-solid region outward by this many mm (smooth SDF offset). "
                          "0 = raw peg STL only (thin). 6mm ≈ old voxel dilate=4 thickness (70k mm³).")
+    ap.add_argument("--force-load-dilate-mm", type=float, default=None,
+                    help="optional separate load-STL BC margin in mm; when unset, use "
+                         "force-bc-dilate-mm for both fix and load STLs")
     ap.add_argument("--bc-proper-bce-highres", default=None,
                     help="optional separate high-res bc_proper.npz (e.g. 128³, 256³) used ONLY for "
                          "sparse BCE — reduces peg-centroid aliasing without affecting dense flow.")
@@ -2309,6 +2683,55 @@ def main():
     from run_config import apply_config
     apply_config(ap, stage='mesh')
     args = ap.parse_args()
+    if args.fea_combine_loads:
+        if not args.fea_back_domain_dir:
+            ap.error('--fea-combine-loads requires --fea-back-domain-dir')
+        second_stl = Path(args.fea_back_domain_dir) / 'load.stl'
+        if not second_stl.exists():
+            ap.error(f'second load STL missing: {second_stl}')
+        os.environ['FEA_SECOND_LOAD_STL'] = str(second_stl.resolve())
+        os.environ['FEA_SECOND_LOAD_MAGNITUDE'] = str(args.fea_back_load_magnitude)
+        os.environ['FEA_SECOND_LOAD_MODE'] = str(args.fea_back_load_mode)
+        print(f'[FEA simultaneous loads] seat={args.load_mode} '
+              f'back={args.fea_back_load_mode} {args.fea_back_load_magnitude:g} N '
+              f'STL={second_stl}', flush=True)
+    sp_iso = (float(args.sp_sdf_guidance_threshold)
+              if args.sp_sdf_guidance_threshold is not None else float(args.mc_threshold))
+    if not -1.0 < sp_iso < 1.0:
+        ap.error('--sp-sdf-guidance-threshold must be between -1 and 1')
+    if args.sp_dense_core_mm < 0 or args.sp_dense_core_w < 0:
+        ap.error('--sp-dense-core-mm and --sp-dense-core-w must be nonnegative')
+    if args.sp_image_proj_w < 0:
+        ap.error('--sp-image-proj-w must be nonnegative')
+    if args.sp_negative_space_w < 0:
+        ap.error('--sp-negative-space-w must be nonnegative')
+    if args.sp_negative_space_w > 0 and not args.sp_negative_space_mask:
+        ap.error('--sp-negative-space-w requires --sp-negative-space-mask')
+    if args.force_load_dilate_mm is not None and args.force_load_dilate_mm < 0:
+        ap.error('--force-load-dilate-mm must be nonnegative')
+    if args.force_bc_fix_only and not args.force_bc_solid:
+        ap.error('--force-bc-fix-only requires --force-bc-solid')
+    if args.sp_support_halo_vox < 0:
+        ap.error('--sp-support-halo-vox must be nonnegative')
+    if not 0 <= args.sp_dense_core_tail_frac <= 1:
+        ap.error('--sp-dense-core-tail-frac must be within [0, 1]')
+    if args.sp_dense_trust_mm < 0 or args.sp_dense_trust_scale <= 0:
+        ap.error('--sp-dense-trust-mm must be nonnegative and --sp-dense-trust-scale positive')
+    if args.sp_dense_core_mm > 0 and not args.sp_sdf_inside_low:
+        ap.error('--sp-dense-core-mm requires --sp-sdf-inside-low')
+    if args.sp_wall_ray_w < 0 or not 1 <= args.sp_wall_ray_band <= 8 or not 0 < args.sp_wall_ray_min_mass <= args.sp_wall_ray_band:
+        ap.error('invalid --sp-wall-ray-* settings')
+    if not 0 <= args.sp_wall_ray_tail_frac <= 1:
+        ap.error('--sp-wall-ray-tail-frac must be within [0, 1]')
+    if args.sp_wall_ray_w > 0 and not args.sp_sdf_inside_low:
+        ap.error('--sp-wall-ray-w requires --sp-sdf-inside-low')
+    if args.sp_side_depth_w < 0 or args.sp_side_depth_tolerance_mm < 0 or not 0 <= args.sp_side_depth_tail_frac <= 1:
+        ap.error('invalid --sp-side-depth-* settings')
+    if args.sp_side_depth_w > 0 and not args.sp_sdf_inside_low:
+        ap.error('--sp-side-depth-w requires --sp-sdf-inside-low')
+    def sp_occupancy_logit(sdf_values, steepness):
+        delta = sp_iso - sdf_values if args.sp_sdf_inside_low else sdf_values - sp_iso
+        return delta * steepness
 
     # In-loop FEM load direction. The FEA solver (fenics_fea_bracket.py) reads it from the
     # LOAD_MODE env var and defaults to 'diag' when unset, so export it here — this makes
@@ -2330,6 +2753,7 @@ def main():
     _fec = bool(getattr(args, 'force_envelope_clip', False))
     _bc_hi = {'active': bool(getattr(args, 'force_bc_solid', False)) or _fec,
               'force_bc': bool(getattr(args, 'force_bc_solid', False)),
+              'fix_only': bool(getattr(args, 'force_bc_fix_only', False)),
               'force_env': _fec,
               'mask': None, 'env_mask': None, 'env_origin': None, 'env_pitch': None,
               'fix_sdf': None, 'load_sdf': None, 'env_sdf': None}
@@ -2391,13 +2815,17 @@ def main():
         # ( >0 inside dilated peg ).  Return the CONTINUOUS signed field mapped to the
         # refiner SDF convention (inside < level) so MC gets a smooth iso-crossing at the
         # dilated peg surface — NO voxel staircase (unlike a hard bool clamp).
-        margin_m = float(getattr(args, 'force_bc_dilate_mm', 0.0)) / 1000.0
+        fix_margin_m = float(args.force_bc_dilate_mm) / 1000.0
+        load_margin_m = float(args.force_load_dilate_mm if args.force_load_dilate_mm is not None
+                              else args.force_bc_dilate_mm) / 1000.0
         d_fix = _check_sdf_range('fix', _bc_hi['fix_sdf'](q), R)
         d_load = _check_sdf_range('load', _bc_hi['load_sdf'](q), R)
-        d_peg = np.maximum(d_fix, d_load) + margin_m  # >0 inside
+        d_peg = (d_fix + fix_margin_m if _bc_hi['fix_only'] else
+                 np.maximum(d_fix + fix_margin_m, d_load + load_margin_m))  # >0 inside
         m = d_peg.reshape(R, R, R).astype(np.float32)
         print(f"[force_bc_solid] built {R}³ BC-solid SDF field: inside(d>0)={int((m>0).sum()):,} voxels "
-              f"(dilate={margin_m*1000:.1f}mm, continuous blend)", flush=True)
+              f"(fix dilate={fix_margin_m*1000:.1f}mm, load dilate={load_margin_m*1000:.1f}mm, "
+              f"continuous blend)", flush=True)
         return m
 
     def _build_env_mask(R):
@@ -2414,26 +2842,96 @@ def main():
         q = np.stack([X, Y, Z], axis=-1).reshape(-1, 3).astype(np.float32)
         # Continuous "allowed region" signed field = max(d_env, d_peg_dilated) (>0 inside allowed).
         # envelope ∪ dilated-pegs.  Return continuous field for smooth clamp (no staircase).
-        margin_m = float(getattr(args, 'force_bc_dilate_mm', 0.0)) / 1000.0
+        fix_margin_m = float(args.force_bc_dilate_mm) / 1000.0
+        load_margin_m = float(args.force_load_dilate_mm if args.force_load_dilate_mm is not None
+                              else args.force_bc_dilate_mm) / 1000.0
         d_env = _check_sdf_range('envelope', _bc_hi['env_sdf'](q), R)   # >0 inside envelope
         d_fix = _check_sdf_range('fix', _bc_hi['fix_sdf'](q), R)
         d_load = _check_sdf_range('load', _bc_hi['load_sdf'](q), R)
-        d_peg = np.maximum(d_fix, d_load) + margin_m
+        d_peg = (d_fix + fix_margin_m if _bc_hi['fix_only'] else
+                 np.maximum(d_fix + fix_margin_m, d_load + load_margin_m))
         d_allowed = np.maximum(d_env, d_peg)                            # >0 inside (env ∪ peg)
         m = d_allowed.reshape(R, R, R).astype(np.float32)
         print(f"[force_envelope_clip] built {R}³ allowed-region SDF field: inside={int((m>0).sum()):,} voxels "
-              f"(peg dilate={margin_m*1000:.1f}mm, continuous)", flush=True)
+              f"(fix dilate={fix_margin_m*1000:.1f}mm, load dilate={load_margin_m*1000:.1f}mm, "
+              f"continuous)", flush=True)
         return m
 
-    if args.save_raw_sdf or _bc_hi['active']:
+    _dense_trust_cache = {}
+    def _dense_trust_field(R):
+        """Sample the dense *3D* mesh SDF only in its bounding box, once per grid size."""
+        if R in _dense_trust_cache:
+            return _dense_trust_cache[R]
+        from pysdf import SDF as _TrustSDF
+        path = Path(args.out) / 'mesh_dense.obj'
+        if not path.exists():
+            raise FileNotFoundError(f'dense trust surface missing: {path}')
+        mesh = _load_sdf_mesh(path)
+        if not mesh.is_watertight:
+            raise ValueError(f'dense trust surface must be watertight: {path}')
+        sdf = _TrustSDF(mesh.vertices.astype(np.float32), mesh.faces.astype(np.uint32))
+        origin = np.asarray(_bc_hi['env_origin'], dtype=np.float32)
+        pitch = np.asarray(_bc_hi['env_pitch'], dtype=np.float32) * (64.0 / R)
+        pad = max(args.sp_dense_trust_mm / 1000.0, float(pitch.max()) * 2)
+        lo = np.maximum(0, np.floor((mesh.bounds[0] - pad - origin) / pitch - 0.5).astype(int))
+        hi = np.minimum(R, np.ceil((mesh.bounds[1] + pad - origin) / pitch - 0.5).astype(int) + 1)
+        ax = origin[0] + (np.arange(lo[0], hi[0], dtype=np.float32) + 0.5) * pitch[0]
+        ay = origin[1] + (np.arange(lo[1], hi[1], dtype=np.float32) + 0.5) * pitch[1]
+        az = origin[2] + (np.arange(lo[2], hi[2], dtype=np.float32) + 0.5) * pitch[2]
+        dist = np.empty((len(ax), len(ay), len(az)), dtype=np.float16)
+        for start in range(0, len(ax), 8):
+            stop = min(start + 8, len(ax))
+            X, Y, Z = np.meshgrid(ax[start:stop], ay, az, indexing='ij')
+            query = np.stack((X, Y, Z), axis=-1).reshape(-1, 3)
+            dist[start:stop] = sdf(query).reshape(stop-start, len(ay), len(az)).astype(np.float16)
+        sl = tuple(slice(int(lo[k]), int(hi[k])) for k in range(3))
+        result = (sl, dist)
+        _dense_trust_cache[R] = result
+        print(f"[dense trust] sampled {dist.size:,} voxels @R={R}, "
+              f"interior core={(dist > args.sp_dense_trust_mm/1000).sum():,}, "
+              f"band={args.sp_dense_trust_mm:.3f}mm", flush=True)
+        return result
+
+    if args.sp_sdf_smooth_sigma < 0:
+        ap.error('--sp-sdf-smooth-sigma must be nonnegative')
+    if args.save_raw_sdf or _bc_hi['active'] or args.sp_dense_trust_mm > 0 or args.sp_sdf_smooth_sigma > 0:
         import skimage.measure as _meas
         _orig_mc = _meas.marching_cubes
         _captured_sdf = []
         def _mc_capture(volume, level=0, **kw):
-            if _bc_hi['active'] and volume.ndim == 3 and max(volume.shape) >= 256:
+            if args.sp_sdf_smooth_sigma > 0 and volume.ndim == 3 and max(volume.shape) >= 512:
+                from scipy.ndimage import gaussian_filter as _gaussian_filter
+                sigma = float(args.sp_sdf_smooth_sigma)
+                inside = np.nonzero(volume < level)  # sparse refiner: lower SDF is solid
+                if inside[0].size:
+                    pad = int(np.ceil(4 * sigma)) + 2
+                    lo = np.maximum(0, np.array([axis.min() for axis in inside]) - pad)
+                    hi = np.minimum(volume.shape, np.array([axis.max() for axis in inside]) + pad + 1)
+                    sl = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+                    source = np.asarray(volume[sl], dtype=np.float32)
+                    occupied_fraction = float((source < level).mean())
+                    smoothed = _gaussian_filter(source, sigma=sigma, mode='nearest')
+                    matched_level = (float(np.quantile(smoothed, occupied_fraction))
+                                     if args.sp_sdf_smooth_volume_match else float(level))
+                    volume = volume.copy()
+                    volume[sl] = (smoothed + float(level) - matched_level).astype(volume.dtype)
+                    print(f"[sparse SDF smooth] sigma={sigma:g} vox, volume_match="
+                          f"{args.sp_sdf_smooth_volume_match}, iso_before={float(level):.5f}, "
+                          f"iso_matched={matched_level:.5f}, crop={tuple((hi-lo).tolist())}",
+                          flush=True)
+            if (_bc_hi['active'] or args.sp_dense_trust_mm > 0) and volume.ndim == 3 and max(volume.shape) >= 256:
                 R = volume.shape[0]
                 volume = volume.copy()
                 lv = float(level)
+                if args.sp_dense_trust_mm > 0:
+                    sl, dist = _dense_trust_field(R)
+                    margin = args.sp_dense_trust_mm / 1000.0
+                    for start in range(0, dist.shape[0], 8):
+                        stop = min(start + 8, dist.shape[0])
+                        d = dist[start:stop].astype(np.float32)
+                        target = (lv - args.sp_dense_trust_scale * (d - margin)).astype(volume.dtype)
+                        view = volume[sl[0].start+start:sl[0].start+stop, sl[1], sl[2]]
+                        np.minimum(view, target, out=view, where=d > margin)
                 # Map a pysdf signed field d (meters, inside>0) to the refiner SDF
                 # convention (inside<level) as: refiner_sdf = level - K*d.
                 # d=0 (surface) → level (iso-crossing) → smooth boundary, no staircase.
@@ -2653,6 +3151,8 @@ def main():
             raise ValueError("--fea-w > 0 requires --fea-domain-dir")
         _ii = np.argwhere(br)                       # br is the 64³ envelope mask
         fea_nodes = env_origin + (_ii + 0.5) * env_pitch
+        fea_nodes = fea_nodes_in_domain_frame(fea_nodes, args.fea_node_alignment,
+                                               "dense grid → FEA domain")
         print(f"  FEA setup: w={args.fea_w} every {args.fea_every_n} step, warmup={args.fea_warmup}, "
               f"{len(fea_nodes)} envelope voxels, domain={args.fea_domain_dir}")
         print(f"    node frame: origin={env_origin*1000} mm  pitch_xyz={env_pitch*1000} mm")
@@ -2673,6 +3173,41 @@ def main():
             import shutil; shutil.copyfile(_src_mesh, str(Path(args.out)/"mesh_dense.obj"))
             print(f"  copied mesh_dense.obj from cache")
         print(f"  latent_index={tuple(latent_index.shape)}, dense_normal_64 valid cells={(dense_normal_64.norm(dim=-1)>1e-4).sum().item()}")
+        # The sparse support expansion below the dense-generation branch is skipped
+        # when a dense cache is loaded. Apply the same prototype expansion here so
+        # sparse ablations have the support requested by their config.
+        if args.shape_anchor_expand_vox > 0:
+            if not args.shape_anchor_bank or args.shape_qd_target < 0:
+                raise ValueError('--shape-anchor-expand-vox needs --shape-anchor-bank and --shape-qd-target')
+            from scipy.ndimage import binary_dilation, distance_transform_edt
+            anchor = np.load(args.shape_anchor_bank)['prototypes'][args.shape_qd_target] > .5
+            anchor_core = anchor.copy()
+            anchor = binary_dilation(anchor, iterations=args.shape_anchor_expand_vox)
+            br_np = br.cpu().numpy() if hasattr(br, 'cpu') else np.asarray(br)
+            bc_np = bc.cpu().numpy() if hasattr(bc, 'cpu') else np.asarray(bc)
+            anchor = (anchor & br_np.astype(bool)) | bc_np.astype(bool)
+            index_np = latent_index.cpu().numpy()
+            current = np.zeros((64, 64, 64), dtype=bool)
+            valid = ((index_np[:, 1:] >= 0) & (index_np[:, 1:] < 64)).all(axis=1)
+            current[index_np[valid, 1], index_np[valid, 2], index_np[valid, 3]] = True
+            additions = anchor & ~current
+            if args.shape_anchor_max_added > 0 and additions.sum() > args.shape_anchor_max_added:
+                distance = distance_transform_edt(~current)
+                # Preserve requested chair members before spending the cap on a halo.
+                core_candidates = np.flatnonzero((additions & anchor_core).ravel())
+                halo_candidates = np.flatnonzero((additions & ~anchor_core).ravel())
+                core_order = core_candidates[np.argsort(distance.ravel()[core_candidates])]
+                halo_order = halo_candidates[np.argsort(distance.ravel()[halo_candidates])]
+                chosen = np.concatenate((core_order, halo_order))[:args.shape_anchor_max_added]
+                additions = np.zeros_like(additions)
+                additions.ravel()[chosen] = True
+            expanded = current | additions
+            coords = np.argwhere(expanded)
+            batch = np.zeros((len(coords), 1), dtype=index_np.dtype)
+            latent_index = torch.from_numpy(np.concatenate([batch, coords], axis=1)).to(latent_index.device).to(latent_index.dtype)
+            print(f"  [shape-anchor expand/cache] target={args.shape_qd_target} "
+                  f"dilation={args.shape_anchor_expand_vox}: +{len(coords)-int(current.sum())} "
+                  f"active voxels (total {len(coords)})", flush=True)
     else:
         # Stage 1: dense FlowDPS
         print(f"\n=== Stage 1: dense FlowDPS (steps={args.dense_steps}, eta={args.eta}) ===")
@@ -2680,6 +3215,9 @@ def main():
                                       num_inference_steps=args.dense_steps,
                                       guidance_scale=args.cfg,
                                       eta=args.eta, bc_w=args.bc_w, out_w=args.out_w, dw=args.dw,
+                                      env_excess_w=args.env_excess_w,
+                                      env_excess_tol=args.env_excess_tol,
+                                      dense_token_policy=args.dense_token_policy,
                                       inner_steps=args.inner_steps, seed=args.seed,
                                       mc_threshold=args.dense_index_threshold,
                                       bce_boundary=(args.bce_boundary if args.bce_boundary is not None else args.dense_index_threshold),
@@ -2704,6 +3242,9 @@ def main():
                                       fea_w=args.fea_w, fea_every_n=args.fea_every_n,
                                       fea_warmup=args.fea_warmup,
                                       fea_domain_dir=args.fea_domain_dir,
+                                      fea_back_domain_dir=args.fea_back_domain_dir,
+                                      fea_back_load_mode=args.fea_back_load_mode,
+                                      fea_back_load_magnitude=args.fea_back_load_magnitude,
                                       fea_nodes=fea_nodes,
                                       fea_mesh_cache=args.fea_mesh_cache,
                                       fea_mesh_size=args.fea_mesh_size,
@@ -2722,10 +3263,26 @@ def main():
                                       shape_qd_target=args.shape_qd_target,
                                       shape_qd_w=args.shape_qd_w,
                                       shape_qd_warmup=args.shape_qd_warmup,
+                                      image_proj_target=args.image_proj_target,
+                                      image_proj_w=args.image_proj_w,
+                                      image_proj_warmup=args.image_proj_warmup,
                                       shape_anchor_bank=args.shape_anchor_bank,
                                       shape_anchor_w=args.shape_anchor_w,
                                       shape_scaffold_w=args.shape_scaffold_w,
-                                      shape_scaffold_pool=args.shape_scaffold_pool)
+                                      shape_scaffold_pool=args.shape_scaffold_pool,
+                                      shape_residual_w=args.shape_residual_w,
+                                      shape_residual_pool=args.shape_residual_pool,
+                                      shape_residual_delta=args.shape_residual_delta,
+                                      shape_residual_neutral_w=args.shape_residual_neutral_w,
+                                      shape_transport_radius=args.shape_transport_radius,
+                                      shape_transport_dims=args.shape_transport_dims,
+                                      shape_transport_ridge=args.shape_transport_ridge,
+                                      shape_transport_max_rel=args.shape_transport_max_rel,
+                                      shape_transport_every=args.shape_transport_every,
+                                      shape_transport_max_updates=args.shape_transport_max_updates,
+                                      oc_flow_w=args.oc_flow_w,
+                                      oc_flow_warmup=args.oc_flow_warmup,
+                                      oc_flow_max_rel=args.oc_flow_max_rel)
     
         # === Stress-aware index expansion (also activate the high-stress region of FEA ∂C/∂ρ) ===
         if args.fea_stress_expand:
@@ -2790,6 +3347,7 @@ def main():
                 raise ValueError('--shape-anchor-expand-vox needs --shape-anchor-bank and --shape-qd-target')
             from scipy.ndimage import binary_dilation as _anchor_dilate
             _anchor_np = np.load(args.shape_anchor_bank)['prototypes'][args.shape_qd_target] > .5
+            _anchor_core = _anchor_np.copy()
             _anchor_np = _anchor_dilate(_anchor_np, iterations=args.shape_anchor_expand_vox)
             _br_np_anchor = br.cpu().numpy() if hasattr(br, 'cpu') else np.asarray(br)
             _bc_np_anchor = bc.cpu().numpy() if hasattr(bc, 'cpu') else np.asarray(bc)
@@ -2801,8 +3359,11 @@ def main():
             if args.shape_anchor_max_added > 0 and _add_anchor.sum() > args.shape_anchor_max_added:
                 from scipy.ndimage import distance_transform_edt as _anchor_edt
                 _dist_anchor = _anchor_edt(~_cur_anchor)
-                _cand_anchor = np.flatnonzero(_add_anchor.ravel())
-                _take_anchor = _cand_anchor[np.argsort(_dist_anchor.ravel()[_cand_anchor])[:args.shape_anchor_max_added]]
+                _core_candidates = np.flatnonzero((_add_anchor & _anchor_core).ravel())
+                _halo_candidates = np.flatnonzero((_add_anchor & ~_anchor_core).ravel())
+                _core_order = _core_candidates[np.argsort(_dist_anchor.ravel()[_core_candidates])]
+                _halo_order = _halo_candidates[np.argsort(_dist_anchor.ravel()[_halo_candidates])]
+                _take_anchor = np.concatenate((_core_order, _halo_order))[:args.shape_anchor_max_added]
                 _add_anchor = np.zeros_like(_add_anchor); _add_anchor.ravel()[_take_anchor] = True
             _union_anchor = _cur_anchor | _add_anchor
             _coords_anchor = np.argwhere(_union_anchor)
@@ -2948,6 +3509,32 @@ def main():
                   f"{_dil_m*1000:.2f}mm): active voxels {_n0:,} → {_n1:,} "
                   f"(dropped {_n0-_n1:,} outside envelope∪pegs)", flush=True)
 
+        # The dense token field can contain tiny, detached components even when
+        # fixed/load BC are mutually reachable.  They are not a valid structural
+        # alternative and become sparse-stage debris if passed onward.  Keep every
+        # 6-connected component anchored to either physical BC; a true BC bridge
+        # remains the responsibility of reachability_loss (--cw), not this filter.
+        if getattr(args, 'dense_keep_bc_components', False):
+            from scipy.ndimage import label as _cc_label
+            _tok = latent_index.detach().cpu().numpy()
+            _active = np.zeros((64, 64, 64), dtype=bool)
+            _valid = ((_tok[:, 1:] >= 0) & (_tok[:, 1:] < 64)).all(axis=1)
+            _tok = _tok[_valid]
+            _active[_tok[:, 1], _tok[:, 2], _tok[:, 3]] = True
+            _bc_np = (bc.detach().cpu().numpy() if hasattr(bc, 'detach') else np.asarray(bc)).astype(bool)
+            _structure = np.zeros((3, 3, 3), dtype=np.uint8)
+            _structure[1, 1, :] = 1; _structure[1, :, 1] = 1; _structure[:, 1, 1] = 1
+            _labels, _n_comp = _cc_label(_active, structure=_structure)
+            _anchored = np.unique(_labels[_bc_np & (_labels > 0)])
+            _keep_active = np.isin(_labels, _anchored)
+            _kept = _tok[_keep_active[_tok[:, 1], _tok[:, 2], _tok[:, 3]]]
+            if len(_anchored) > 0 and len(_kept) > 0:
+                print(f"  [dense-bc-components] {_n_comp} active components → {len(_anchored)} BC-anchored; "
+                      f"tokens {len(_tok):,} → {len(_kept):,}", flush=True)
+                latent_index = torch.from_numpy(_kept).to(latent_index.device).to(latent_index.dtype)
+            else:
+                print("  [dense-bc-components] no BC-anchored component found; leaving tokens unchanged", flush=True)
+
         latent_index = sort_block(latent_index, pipe.sparse_dit_512.selection_block_size)
 
         # Save dense-stage MC mesh (envelope-masked, in envelope world frame)
@@ -2994,9 +3581,17 @@ def main():
             # Reuse env_origin / env_pitch computed before dense_flowdps_inference (same convention as snapshots).
             v_d_world = env_origin + (v_d + 0.5) * env_pitch
             mesh_dense = trimesh.Trimesh(v_d_world, f_d)
+            if getattr(args, 'dense_keep_largest_mesh_component', False):
+                _parts = mesh_dense.split(only_watertight=False)
+                if len(_parts) > 1:
+                    _areas = [float(part.area) for part in _parts]
+                    _keep_i = int(np.argmax(_areas))
+                    mesh_dense = _parts[_keep_i]
+                    print(f"  [dense-mesh-components] {len(_parts)} MC components → largest BC-bearing "
+                          f"surface (area {mesh_dense.area:.6g} m²; removed {len(_parts)-1} tiny debris components)", flush=True)
             out_d = Path(args.out); out_d.mkdir(parents=True, exist_ok=True)
             mesh_dense.export(str(out_d / 'mesh_dense.obj'))
-            print(f"  [dense MC] saved mesh_dense.obj V={len(v_d):,} F={len(f_d):,} "
+            print(f"  [dense MC] saved mesh_dense.obj V={len(mesh_dense.vertices):,} F={len(mesh_dense.faces):,} "
                   f"(envelope-masked, world frame)", flush=True)
         except Exception as e:
             import traceback as _tb
@@ -3033,8 +3628,26 @@ def main():
             print(f"[skip_sparse] copy failed: {e}")
         return
 
+    # Give the sparse decoder degrees of freedom just outside the coarse dense
+    # surface, without changing the dense mesh or its topology target.  This
+    # placement also applies when Stage 1 was loaded from a dense cache.
+    _sparse_reference_index = latent_index
+    if args.sp_support_halo_vox:
+        from scipy.ndimage import binary_dilation as _halo_dilate
+        _old_idx = latent_index.detach().cpu().numpy()
+        _old_occ = np.zeros((64, 64, 64), dtype=bool)
+        _old_occ[_old_idx[:, 1], _old_idx[:, 2], _old_idx[:, 3]] = True
+        _new_occ = _halo_dilate(_old_occ, iterations=args.sp_support_halo_vox)
+        _new_coords = np.argwhere(_new_occ)
+        _new_idx = np.column_stack((np.zeros(len(_new_coords), dtype=_old_idx.dtype), _new_coords))
+        latent_index = sort_block(torch.from_numpy(_new_idx).to(_sparse_reference_index.device),
+                                  pipe.sparse_dit_512.selection_block_size)
+        print(f"  [sparse-support halo] {int(_old_occ.sum()):,} -> {len(_new_coords):,} "
+              f"active tokens; dense topology target unchanged", flush=True)
+
     # ========== Sparse FEA hook setup (ported from sparse_flowdps_localattn.py) ==========
     sp_fea_cache = None
+    sp_fea_reference = {}
     sp_fea_hook_counter = [0]
     # Common setup (always needed when sp_fea_w > 0, regardless of mode):
     if args.sp_fea_w > 0 or args.posthoc_fea_steps > 0:
@@ -3046,6 +3659,8 @@ def main():
         from fea_compliance_loss import voxel_nodes_from_stl, fea_compliance_loss
         bracket_mask_np, nodes_inside_np, pitch_m = voxel_nodes_from_stl(
             args.bracket_occ, args.fea_bracket_stl or 'data_real/bracket/original_DesignSpace.stl')
+        nodes_inside_np = fea_nodes_in_domain_frame(nodes_inside_np, args.fea_node_alignment,
+                                                     "sparse grid → FEA domain")
         from pathlib import Path as _P
         import shutil as _sh
         _dom_dir = args.fea_domain_dir or '/tmp/fea_dom_sparse'
@@ -3059,6 +3674,10 @@ def main():
                 _sh.copy(_src, _dst)
         _bc_d = np.load(args.bc_proper)
         bc_mask_64 = (_bc_d['fix'].astype(bool) | _bc_d['load'].astype(bool))
+        if args.fea_back_domain_dir:
+            if 'back_load' not in _bc_d.files:
+                raise ValueError('dual FEA requires back_load in --bc-proper NPZ')
+            bc_mask_64 |= _bc_d['back_load'].astype(bool)
         # force-bc-solid: use the SAME STL-SDF BC definition as generation (dilate margin),
         # built at 64³ (FEA grid). Consistent meshgrid convention with make_bc_proper_pysdf.
         if _bc_hi.get('active'):
@@ -3150,7 +3769,7 @@ def main():
                     # backprop into the dense rhs reliably for this shape.
                     N_pts = sdf_in.shape[0]
                     if N_pts > 0:
-                        src_vals = (torch.sigmoid((sdf_in - args.mc_threshold) * args.sp_fea_steepness)
+                        src_vals = (torch.sigmoid(sp_occupancy_logit(sdf_in, args.sp_fea_steepness))
                                     if args.sp_fea_reduce == 'soft_frac' else sdf_in)
                         sums = torch.zeros(R64**3, device=sdf.device, dtype=src_vals.dtype
                                            ).scatter_add(0, flat_idx, src_vals)
@@ -3166,10 +3785,11 @@ def main():
                         dense = dense_mean.view(R64, R64, R64)
                         occ_logits = torch.logit(dense.clamp(1e-6, 1-1e-6))
                     else:
-                        dense = torch.where(cnts > 0, dense_mean, torch.tensor(-1.0, device=sdf.device, dtype=sdf.dtype)).view(R64, R64, R64)
+                        _missing_sdf = 1.0 if args.sp_sdf_inside_low else -1.0
+                        dense = torch.where(cnts > 0, dense_mean, torch.tensor(_missing_sdf, device=sdf.device, dtype=sdf.dtype)).view(R64, R64, R64)
                         # paper ref: main text, SIMP-style density rho = sigma(k * sdf), penalization
                         #            exponent p (Supplementary penalization ablation, Table tab:penal).
-                        occ_logits = (dense - args.mc_threshold) * args.sp_fea_steepness
+                        occ_logits = sp_occupancy_logit(dense, args.sp_fea_steepness)
                     # Clamp envelope-inside logits → ρ ∈ [~0.007, ~0.993] so the fenics K matrix
                     # condition number stays bounded (else ρ=1 vs ρ=1e-3 → cond ~1e9 → solver fails).
                     occ_logits = occ_logits.clamp(-5.0, 5.0)
@@ -3191,9 +3811,11 @@ def main():
                     # force-bc-solid: pass BC mask so FEA sets ρ=1 at BC and zeros its gradient
                     # (BC = always-solid peg, not a learning target). bc64 is [Z,Y,X] @64³.
                     _fea_bc_mask = bc64.astype(bool) if getattr(args, 'force_bc_solid', False) else None
-                    fea_loss = fea_compliance_loss(occ_logits, br_np, nd_np, dom, args.fea_mesh_cache,
-                                                   mesh_size=args.fea_mesh_size, penal=3.0,
-                                                   bc_mask_np=_fea_bc_mask)
+                    fea_loss, seat_loss, back_loss = paired_fea_compliance(
+                        occ_logits, br_np, nd_np, dom, args.fea_back_domain_dir,
+                        args.fea_mesh_cache, args.fea_mesh_size, args.fea_penal,
+                        sp_fea_reference, args.fea_back_load_mode,
+                        args.fea_back_load_magnitude, bc_mask_np=_fea_bc_mask)
                     if not torch.isfinite(fea_loss).item():
                         print(f"    [sp FEA step {step_holder[0]}] SKIP comp={fea_loss.item()} (non-finite)", flush=True)
                     else:
@@ -3206,6 +3828,14 @@ def main():
                             try: res.prev_sample = res.prev_sample - lat.grad * args.sp_fea_step_size
                             except: pass
                             print(f"    [sp FEA step {step_holder[0]}] comp={fea_loss.item():.3e} decay={decay:.2f} grad_norm={lat.grad.norm().item():.3e}", flush=True)
+                            if back_loss is not None:
+                                print(f"    [sp dual FEA step {step_holder[0]}] "
+                                      f"seat={seat_loss.item():.4e} "
+                                      f"back={back_loss.item():.4e} "
+                                      f"balanced={fea_loss.item():.4e}", flush=True)
+                            elif args.fea_combine_loads:
+                                print(f"    [sp simultaneous FEA step {step_holder[0]}] "
+                                      f"C={fea_loss.item():.4e}", flush=True)
                         else:
                             print(f"    [sp FEA step {step_holder[0]}] SKIP grad non-finite (comp={fea_loss.item():.3e})", flush=True)
                         # log to loss CSV regardless of grad apply success
@@ -3247,6 +3877,43 @@ def main():
     # Final: refiner + MC
     print(f"\n=== Stage 2: sparse512 with GuideFlow3D guidance ===")
     print(f"  active voxels: {len(latent_index)}")
+    # A shape-independent feasibility constraint: preserve the interior of the
+    # dense 3D surface when refining it. The dense result carries the macro
+    # topology selected by the image/QD stage; sparse sampling may alter only
+    # its boundary band. This is a signed-distance constraint over the entire
+    # part, not a hand-drawn repair region around particular bosses.
+    _dense_core_sdf = None
+    _dense_core_cache = {}
+    if args.sp_dense_core_mm > 0:
+        from pysdf import SDF as _CoreSDF
+        _dense_core_path = Path(args.out) / 'mesh_dense.obj'
+        if not _dense_core_path.exists():
+            raise FileNotFoundError(f'dense core anchor missing: {_dense_core_path}')
+        _dense_core_mesh = trimesh.load(str(_dense_core_path), force='mesh', process=False)
+        if not _dense_core_mesh.is_watertight:
+            raise ValueError(f'dense core anchor must be watertight: {_dense_core_path}')
+        _dense_core_sdf = _CoreSDF(_dense_core_mesh.vertices.astype(np.float32),
+                                   _dense_core_mesh.faces.astype(np.uint32))
+        print(f"  [dense core] anchor={_dense_core_path} margin={args.sp_dense_core_mm:.3f}mm "
+              f"weight={args.sp_dense_core_w:.3g}", flush=True)
+
+    def _dense_core_mask(coords):
+        if _dense_core_sdf is None:
+            return None
+        cached = _dense_core_cache.get('coords')
+        if cached is not None and cached.shape == coords.shape and torch.equal(cached, coords):
+            return _dense_core_cache['mask']
+        ijk = coords[:, 1:].detach().cpu().numpy().astype(np.float32)
+        pitch512 = np.asarray(env_pitch, dtype=np.float32) * (64.0 / 512.0)
+        world = np.asarray(env_origin, dtype=np.float32) + (ijk + 0.5) * pitch512
+        distance = _dense_core_sdf(world)
+        inside = distance >= args.sp_dense_core_mm / 1000.0
+        mask = torch.from_numpy(inside).to(device=coords.device)
+        _dense_core_cache['coords'] = coords.detach()
+        _dense_core_cache['mask'] = mask
+        print(f"  [dense core] protected {int(inside.sum()):,}/{len(inside):,} "
+              f"sparse SDF samples ({100*inside.mean():.1f}%)", flush=True)
+        return mask
     # === Memory hygiene before sparse stage ===
     # 1) Force eval mode on sparse modules (no dropout, no train-time bookkeeping)
     try: pipe.sparse_dit_512.eval()
@@ -3271,9 +3938,18 @@ def main():
 
     # Pre-compute dense active mask at 64³ from latent_index — used by topology_no_hole_loss
     dense_active_64 = torch.zeros(64, 64, 64, dtype=torch.bool, device='cuda')
-    coords_np_64 = latent_index.cpu().numpy()
+    coords_np_64 = _sparse_reference_index.cpu().numpy()
     dense_active_64[coords_np_64[:, 1], coords_np_64[:, 2], coords_np_64[:, 3]] = True
     print(f"  dense active mask: {int(dense_active_64.sum())} / {64**3} voxels solid", flush=True)
+    _wall_fronts = prepare_side_fronts(dense_active_64) if args.sp_wall_ray_w > 0 else None
+    _side_depth_refs = None
+    if args.sp_side_depth_w > 0:
+        _side_depth_refs = dense_side_depth_reference(
+            Path(args.out) / 'mesh_dense.obj', dense_active_64, env_origin, env_pitch,
+            tolerance_mm=args.sp_side_depth_tolerance_mm)
+        print(f"  [side-depth ref] rays={[r['valid_rays'] for r in _side_depth_refs]} "
+              f"mean surface offsets={[round(r['mean_reference_offset'], 2) for r in _side_depth_refs]} "
+              f"tolerance={args.sp_side_depth_tolerance_mm:.2f}mm", flush=True)
 
     # === sp_shell_only — drop deep_int voxels from sparse stage latent_index ===
     # dense_active_64 still keeps all voxels (BG of mesh extraction will fill deep_int as +1.0)
@@ -3346,8 +4022,30 @@ def main():
           f"thick_target={args.sp_thick_target}", flush=True)
     _shape_qd_sparse = None
     _shape_anchor_sparse = None
+    _sp_image_projection = None
+    _sp_projection_env = None
+    _sp_negative_space = None
     _shape_bc_64 = torch.from_numpy(bc.cpu().numpy().astype(np.float32)
                                        if hasattr(bc, 'cpu') else np.asarray(bc).astype(np.float32)).to('cuda')
+    if args.sp_image_proj_w > 0:
+        if not args.image_proj_target:
+            raise ValueError('--sp-image-proj-w requires --image-proj-target')
+        from image_projection_loss import ImageProjectionLoss
+        _sp_image_projection = ImageProjectionLoss(args.image_proj_target, 'cuda')
+        _sp_projection_env = torch.from_numpy(np.asarray(br, dtype=np.float32)).to('cuda')
+        print(f"  sparse image projection: target={args.image_proj_target} "
+              f"w={args.sp_image_proj_w}", flush=True)
+    if args.sp_negative_space_w > 0:
+        _neg_npz = np.load(args.sp_negative_space_mask)
+        _neg_np = np.asarray(_neg_npz['mask'], dtype=bool)
+        if _neg_np.shape != (64, 64, 64):
+            raise ValueError('sp-negative-space-mask must contain mask[64,64,64]')
+        _bc_np = np.asarray(bc.cpu().numpy() if hasattr(bc, 'cpu') else bc, dtype=bool)
+        if np.any(_neg_np & _bc_np):
+            raise ValueError('sp-negative-space-mask overlaps mandatory BC voxels')
+        _sp_negative_space = torch.from_numpy(_neg_np).to('cuda')
+        print(f"  sparse negative space: mask={args.sp_negative_space_mask} "
+              f"voxels={int(_neg_np.sum()):,} w={args.sp_negative_space_w}", flush=True)
     if args.sp_shape_qd_w > 0:
         if not args.shape_qd_archive or args.shape_qd_target < 0:
             raise ValueError('--sp-shape-qd-w needs --shape-qd-archive and --shape-qd-target')
@@ -3517,7 +4215,7 @@ def main():
                         _is_di_sp = _di_t[_cd64[:, 0], _cd64[:, 1], _cd64[:, 2]]   # (M,)
                         _di_mask = _is_di_sp.bool().unsqueeze(-1)                  # (M, 1)
                         # Use mc_threshold + 1.0 → guaranteed inside for marching cubes
-                        _inside_target = float(args.mc_threshold + 1.0)
+                        _inside_target = float(sp_iso - 1.0 if args.sp_sdf_inside_low else sp_iso + 1.0)
                         if step_i == 0 and inner_i == 0:
                             _n_di = int(_is_di_sp.sum().item()); _n_tot = sdf_sp.shape[0]
                             print(f"  [interior-freeze D-improved] erode={args.sp_interior_erode}, mc_thr={args.mc_threshold}, clamp_to={_inside_target}, step 0: {_n_di}/{_n_tot} ({100*_n_di/_n_tot:.1f}%) voxels clamped", flush=True)
@@ -3531,14 +4229,13 @@ def main():
                         _cd512 = cd_sp[:, 1:].long().clamp(0, 511)
                         _is_bc_sp = _bc_solid_t[_cd512[:, 0], _cd512[:, 1], _cd512[:, 2]]
                         _bc_mask_sp = _is_bc_sp.bool().unsqueeze(-1)
-                        _bc_solid_val = torch.full_like(sdf_sp, fill_value=float(args.mc_threshold + 1.0))
+                        _bc_solid_val = torch.full_like(sdf_sp, fill_value=float(sp_iso - 1.0 if args.sp_sdf_inside_low else sp_iso + 1.0))
                         sdf_sp = torch.where(_bc_mask_sp, _bc_solid_val, sdf_sp)
-                    # CONVENTION FIX: topopt_rmin_loss / thickness_per_voxel_loss
-                    # were authored for inside-NEGATIVE, surface-at-0. The refiner field here is
-                    # inside-POSITIVE (solid = s > mc_threshold, surface iso @ mc_threshold; see
-                    # BC clamp above → mc_threshold+1.0). Feed s̃ = mc_threshold − sdf_sp so
-                    # φ=s−mc_threshold maps to inside-negative → thickness/rmin act on SOLID.
-                    _sdf_sp_in = args.mc_threshold - sdf_sp
+                    # The losses below expect negative-inside SDF. The decoder/MC path
+                    # initializes unobserved voxels to +1 and unions solid BC with MIN,
+                    # so its actual material convention is sdf < iso. The opt-in corrected
+                    # mode uses sdf - iso; legacy mode remains for reproducibility.
+                    _sdf_sp_in = sdf_sp - sp_iso if args.sp_sdf_inside_low else sp_iso - sdf_sp
                     l_rmin = topopt_rmin_loss(_sdf_sp_in, cd_sp,
                                               grid_res=128, r_min_voxels=args.sp_r_min_voxels,
                                               void_weight=args.sp_rmin_void_weight,
@@ -3652,7 +4349,7 @@ def main():
                         l_snap = torch.zeros((), device=sdf_sp.device)
                     if args.sp_vw > 0 or args.sp_aug_lag:
                         # Mean occupancy over sparse active voxels → target.
-                        _occ_p = torch.sigmoid((sdf_sp.squeeze(-1) - args.mc_threshold) * args.sp_bce_steepness)
+                        _occ_p = torch.sigmoid(sp_occupancy_logit(sdf_sp.squeeze(-1), args.sp_bce_steepness))
                         # (4) Heaviside projection + beta-continuation + eta bisection (TO standard)
                         if args.sp_heaviside_proj:
                             _sf_h = float(step_i) / max(1.0, float(args.sparse_steps))
@@ -3675,8 +4372,45 @@ def main():
                     else:
                         l_vol = torch.zeros((), device=sdf_sp.device)
                         _g_vol = None
+                    if args.sp_dense_core_mm > 0 and args.sp_dense_core_w > 0:
+                        _core = _dense_core_mask(cd_sp)
+                        _core_target = sp_iso - 0.1
+                        _core_pen = F.softplus((sdf_sp.squeeze(-1) - _core_target) * 10.0) / 10.0
+                        if args.sp_dense_core_tail_frac > 0:
+                            _violations = _core_pen[_core]
+                            _k = max(1, int(_violations.numel() * args.sp_dense_core_tail_frac))
+                            l_dense_core = _violations.topk(_k, sorted=False).values.mean()
+                        else:
+                            l_dense_core = (_core_pen * _core).sum() / _core.sum().clamp(min=1)
+                    else:
+                        l_dense_core = torch.zeros((), device=sdf_sp.device)
+                    if _wall_fronts is not None:
+                        l_wall_ray, _wall_ray_stats = sparse_side_front_loss(
+                            sdf_sp, cd_sp, _wall_fronts, sp_iso,
+                            band_voxels=args.sp_wall_ray_band,
+                            min_solid_mass=args.sp_wall_ray_min_mass,
+                            tail_fraction=args.sp_wall_ray_tail_frac,
+                            grid_size=512)
+                        if step_i == 0 and inner_i == 0:
+                            print(f"  [wall-ray] {_wall_ray_stats} band={args.sp_wall_ray_band} "
+                                  f"min_mass={args.sp_wall_ray_min_mass} "
+                                  f"tail_frac={args.sp_wall_ray_tail_frac}", flush=True)
+                    else:
+                        l_wall_ray = torch.zeros((), device=sdf_sp.device)
+                    if _side_depth_refs is not None:
+                        l_side_depth, _side_depth_stats = sparse_side_depth_loss(
+                            sdf_sp, cd_sp, _side_depth_refs, sp_iso,
+                            tail_fraction=args.sp_side_depth_tail_frac)
+                        if step_i == 0 and inner_i == 0:
+                            print(f"  [side-depth] {_side_depth_stats} "
+                                  f"tail_frac={args.sp_side_depth_tail_frac}", flush=True)
+                    else:
+                        l_side_depth = torch.zeros((), device=sdf_sp.device)
                     loss = (args.sp_rmin_w * l_rmin
                             + args.sp_thick_w * l_thick
+                            + args.sp_dense_core_w * l_dense_core
+                            + args.sp_wall_ray_w * l_wall_ray
+                            + args.sp_side_depth_w * l_side_depth
                             + args.sp_hole_w * l_hole
                             + args.sp_interior_w * l_interior
                             + args.sp_normal_w * l_normal
@@ -3709,7 +4443,7 @@ def main():
                         _R_mask = int(_bc_64.shape[0])
                         _ratio  = max(1, 512 // _R_mask)
                         _xyz = (cd_sp[:, 1:].long() // _ratio).clamp(0, _R_mask - 1)
-                        _occ_logit = (sdf_sp.squeeze(-1) - args.mc_threshold) * args.sp_bce_steepness
+                        _occ_logit = sp_occupancy_logit(sdf_sp.squeeze(-1), args.sp_bce_steepness)
                         _ones = torch.ones_like(_occ_logit); _zeros = torch.zeros_like(_occ_logit)
                         _bce_solid = F.binary_cross_entropy_with_logits(_occ_logit, _ones, reduction='none')
                         _bce_empty = F.binary_cross_entropy_with_logits(_occ_logit, _zeros, reduction='none')
@@ -3731,10 +4465,10 @@ def main():
                     # 64³ proxy used by dense targeting, then retain the target morphology
                     # through the refiner.  Missing sparse cells stay empty.
                     if ((_shape_qd_sparse is not None and step_i / max(1.0, float(args.sparse_steps)) >= args.sp_shape_qd_warmup)
-                            or _shape_anchor_sparse is not None):
+                            or _shape_anchor_sparse is not None or _sp_image_projection is not None):
                         _xyz_qd = (cd_sp[:, 1:].long() // 8).clamp(0, 63)
                         _flat_qd = _xyz_qd[:, 0] * 4096 + _xyz_qd[:, 1] * 64 + _xyz_qd[:, 2]
-                        _occ_qd = torch.sigmoid((sdf_sp.squeeze(-1) - args.mc_threshold) * args.sp_bce_steepness)
+                        _occ_qd = torch.sigmoid(sp_occupancy_logit(sdf_sp.squeeze(-1), args.sp_bce_steepness))
                         _sum_qd = torch.zeros(64**3, device=sdf_sp.device, dtype=_occ_qd.dtype)
                         _cnt_qd = torch.zeros(64**3, device=sdf_sp.device, dtype=_occ_qd.dtype)
                         _sum_qd.scatter_add_(0, _flat_qd, _occ_qd)
@@ -3745,11 +4479,29 @@ def main():
                             loss = loss + args.sp_shape_qd_w * _l_shape_qd
                             if step_i % max(1, args.sparse_steps // 5) == 0 and inner_i == 0:
                                 print(f"  [sp Shape-QD] step {step_i}: loss={_l_shape_qd.item():.4f}", flush=True)
+                        if _sp_image_projection is not None:
+                            _l_sp_image = _sp_image_projection.loss(_logit_qd, _sp_projection_env)
+                            loss = loss + args.sp_image_proj_w * _l_sp_image
+                            if step_i % max(1, args.sparse_steps // 5) == 0 and inner_i == 0:
+                                print(f"  [sp image projection] step {step_i}: loss={_l_sp_image.item():.4f}", flush=True)
                     if _shape_anchor_sparse is not None:
                         _l_anchor_sp = _shape_anchor_sparse.loss(_logit_qd, _shape_bc_64)
                         loss = loss + args.sp_shape_anchor_w * _l_anchor_sp
                         if step_i % max(1, args.sparse_steps // 5) == 0 and inner_i == 0:
                             print(f"  [sp shape anchor] step {step_i}: loss={_l_anchor_sp.item():.4f}", flush=True)
+                    if _sp_negative_space is not None:
+                        _neg_xyz = (cd_sp[:, 1:].long() // 8).clamp(0, 63)
+                        _neg_select = _sp_negative_space[
+                            _neg_xyz[:, 0], _neg_xyz[:, 1], _neg_xyz[:, 2]]
+                        if _neg_select.any():
+                            # The sparse decoder/refiner convention is negative-inside;
+                            # use the high-res decoded SDF directly, not the 64³ mean proxy.
+                            _neg_solid_logit = (sp_iso - sdf_sp.squeeze(-1)) * args.sp_bce_steepness
+                            _l_neg = F.softplus(_neg_solid_logit[_neg_select]).mean()
+                            loss = loss + args.sp_negative_space_w * _l_neg
+                            if step_i % max(1, args.sparse_steps // 5) == 0 and inner_i == 0:
+                                print(f"  [sp negative space] step {step_i}: loss={_l_neg.item():.4f} "
+                                      f"active={int(_neg_select.sum())}", flush=True)
                     # ── ADAMW-MODE SPARSE FEA INTEGRATION ────────────────────
                     # adamw mode: build the FEA term from the SAME decoder graph and add it
                     # to the regular sparse guidance loss.  A previous implementation called
@@ -3769,8 +4521,8 @@ def main():
                                 _R64 = 64
                                 _xyz_a = (cd_sp[:, 1:].long() // 8).clamp(0, 63)
                                 _flat_a = _xyz_a[:,0]*_R64*_R64 + _xyz_a[:,1]*_R64 + _xyz_a[:,2]
-                                _src_a = (torch.sigmoid((sdf_sp.squeeze(-1) - args.mc_threshold)
-                                                        * args.sp_fea_steepness)
+                                _src_a = (torch.sigmoid(sp_occupancy_logit(
+                                    sdf_sp.squeeze(-1), args.sp_fea_steepness))
                                           if args.sp_fea_reduce == 'soft_frac'
                                           else sdf_sp.squeeze(-1))
                                 _sums = torch.zeros(_R64**3, device=sdf_sp.device, dtype=_src_a.dtype)
@@ -3782,7 +4534,7 @@ def main():
                                 if args.sp_fea_reduce == 'soft_frac':
                                     _occ_l = torch.logit(_dmean.clamp(1e-6, 1-1e-6))
                                 else:
-                                    _occ_l = (_dmean - args.mc_threshold) * args.sp_fea_steepness
+                                    _occ_l = sp_occupancy_logit(_dmean, args.sp_fea_steepness)
                                 _occ_l = _occ_l.clamp(-5.0, 5.0).view(_R64, _R64, _R64)
                                 _occ_l = torch.where(_br_t_a.bool(), _occ_l,
                                                       torch.tensor(-5.0, device=_occ_l.device, dtype=_occ_l.dtype))
@@ -3790,15 +4542,24 @@ def main():
                                                       torch.tensor(5.0, device=_occ_l.device, dtype=_occ_l.dtype),
                                                       _occ_l)
                                 _occ_l = _occ_l.float()
-                                _fea_a = fea_compliance_loss(_occ_l, _br_np_a, _nd_np_a, _dom_a,
-                                                              args.fea_mesh_cache,
-                                                              mesh_size=args.fea_mesh_size, penal=3.0)
+                                _fea_a, _seat_a, _back_a = paired_fea_compliance(
+                                    _occ_l, _br_np_a, _nd_np_a, _dom_a,
+                                    args.fea_back_domain_dir, args.fea_mesh_cache,
+                                    args.fea_mesh_size, args.fea_penal, sp_fea_reference,
+                                    args.fea_back_load_mode, args.fea_back_load_magnitude)
                                 if torch.isfinite(_fea_a).item():
                                     _decay_a = max(0.3, 1.0 - 0.7 * _sp_sf)
                                     _fea_term_a = _fea_a / (_fea_a.detach().abs() + 1e-12) if args.sp_fea_normalize else _fea_a
                                     _scaled_fea = args.sp_fea_w * _decay_a * _fea_term_a
                                     _last_fea_adamw = float(_fea_a.item())
                                     print(f"    [sp FEA adamw step {step_i}] comp={_fea_a.item():.3e} decay={_decay_a:.2f} (combined-bw)", flush=True)
+                                    if _back_a is not None:
+                                        print(f"    [sp dual FEA adamw step {step_i}] "
+                                              f"seat={_seat_a.item():.4e} "
+                                              f"back={_back_a.item():.4e}", flush=True)
+                                    elif args.fea_combine_loads:
+                                        print(f"    [sp simultaneous FEA adamw step {step_i}] "
+                                              f"C={_fea_a.item():.4e}", flush=True)
                                     del _fea_a, _fea_term_a, _occ_l, _sums, _cnts, _dmean, _src_a, _ones_a, _flat_a, _xyz_a, _br_t_a, _bc_t_a
                             except Exception as _e:
                                 print(f"    [sp FEA adamw step {step_i}] FAIL: {type(_e).__name__}: {str(_e)[:120]}", flush=True)
@@ -3806,7 +4567,23 @@ def main():
                     if _scaled_fea is not None:
                         print(f"    [sp FEA combined grad step {step_i}] total_norm={sp_param.grad.norm().item():.3e}", flush=True)
                         _scaled_fea = None
+                    _grad_debug = (os.environ.get('D3DS2_SPARSE_GRAD_DEBUG', '0') == '1'
+                                   and inner_i == n_inner - 1
+                                   and (step_i == 0 or step_i == args.sparse_steps - 1))
+                    if _grad_debug:
+                        _before_step = sp_param.detach().clone()
+                        _grad = sp_param.grad
+                        print(f"  [sparse grad diagnostic] step={step_i} "
+                              f"grad_norm={_grad.norm().item() if _grad is not None else float('nan'):.6e} "
+                              f"grad_nonzero={int(torch.count_nonzero(_grad).item()) if _grad is not None else 0}",
+                              flush=True)
                     sp_opt.step()
+                    if _grad_debug:
+                        _delta = sp_param.detach() - _before_step
+                        print(f"  [sparse grad diagnostic] step={step_i} "
+                              f"param_delta_norm={_delta.norm().item():.6e} "
+                              f"param_delta_max={_delta.abs().max().item():.6e}", flush=True)
+                        del _before_step, _delta
                     sp_opt.zero_grad(set_to_none=True)
                     # === multi-res REPRESENTATION pool: force sp_param to be coarse ===
                     if args.sp_param_pool_schedule:
@@ -3860,10 +4637,13 @@ def main():
                         _edt_str = f" edt={l_edt.item():.5f}" if args.sp_edt_w > 0 else ""
                         _snap_str = f" snap={l_snap.item():.5f}" if args.sp_snap_w > 0 else ""
                         _vol_str = f" vol={l_vol.item():.5f}" if args.sp_vw > 0 else ""
+                        _core_str = f" core={l_dense_core.item():.5f}" if args.sp_dense_core_w > 0 else ""
+                        _wall_str = f" wallray={l_wall_ray.item():.5f}" if args.sp_wall_ray_w > 0 else ""
+                        _side_depth_str = f" sidedepth={l_side_depth.item():.5f}" if args.sp_side_depth_w > 0 else ""
                         print(f"  [sp guide] step {step_i+1:2d}/{args.sparse_steps} t={float(t):.0f}  "
                               f"inner={inner_i+1}/{n_inner} w={w_now:.1f}  "
                               f"total={loss.item():.5f} rmin={l_rmin.item():.5f} "
-                              f"thick={l_thick.item():.5f} hole={l_hole.item():.5f}{_norm_str}{_over_str}{_nfd_str}{_lap_str}{_coh_str}{_aniso_str}{_odw_str}{_dfodw_str}{_edt_str}{_snap_str}{_vol_str} "
+                              f"thick={l_thick.item():.5f} hole={l_hole.item():.5f}{_core_str}{_wall_str}{_side_depth_str}{_norm_str}{_over_str}{_nfd_str}{_lap_str}{_coh_str}{_aniso_str}{_odw_str}{_dfodw_str}{_edt_str}{_snap_str}{_vol_str} "
                               f"M={sdf_sp.shape[0]}", flush=True)
                     # log only the last inner iteration per outer step (avoid n_inner duplicates)
                     if inner_i == n_inner - 1:
@@ -3876,7 +4656,7 @@ def main():
                                        f'{float(l_normalfd.item()):.6e},{float(l_lap.item()):.6e},'
                                        f'{float(l_aniso.item()):.6e},{float(l_vol.item()):.6e},,\n')
                         loss_csv.flush()
-                    del loss, l_rmin, l_thick, l_hole, l_interior, l_normal, l_overhang, l_normalfd, l_lap, l_coh, l_aniso, l_odw, l_dfodw, l_edt, l_snap, l_vol, sdf_sp, cd_sp, reconst_x, feat, ld, ldsp
+                    del loss, l_rmin, l_thick, l_hole, l_interior, l_dense_core, l_wall_ray, l_side_depth, l_normal, l_overhang, l_normalfd, l_lap, l_coh, l_aniso, l_odw, l_dfodw, l_edt, l_snap, l_vol, sdf_sp, cd_sp, reconst_x, feat, ld, ldsp
                     _gc.collect(); torch.cuda.empty_cache()
                 except Exception as e:
                     print(f"  [sp guide] step {step_i+1} inner {inner_i} FAIL {type(e).__name__}: {str(e)[:80]}",
@@ -3958,7 +4738,7 @@ def main():
                     _fi = _xyz_in[:,0]*R64*R64 + _xyz_in[:,1]*R64 + _xyz_in[:,2]
                     _Np = _sdf_in.shape[0]
                     if _Np > 0:
-                        _src = (torch.sigmoid((_sdf_in - args.mc_threshold) * args.sp_fea_steepness)
+                        _src = (torch.sigmoid(sp_occupancy_logit(_sdf_in, args.sp_fea_steepness))
                                 if args.sp_fea_reduce == 'soft_frac' else _sdf_in)
                         _sums = torch.zeros(R64**3, device=_sdf.device, dtype=_src.dtype
                                             ).scatter_add(0, _fi, _src)
@@ -3973,8 +4753,9 @@ def main():
                         _dense = _dm.view(R64, R64, R64)
                         _ol = torch.logit(_dense.clamp(1e-6, 1-1e-6))
                     else:
-                        _dense = torch.where(_cnts > 0, _dm, torch.tensor(-1.0, device=_sdf.device, dtype=_sdf.dtype)).view(R64, R64, R64)
-                        _ol = (_dense - args.mc_threshold) * args.sp_fea_steepness
+                        _missing_sdf = 1.0 if args.sp_sdf_inside_low else -1.0
+                        _dense = torch.where(_cnts > 0, _dm, torch.tensor(_missing_sdf, device=_sdf.device, dtype=_sdf.dtype)).view(R64, R64, R64)
+                        _ol = sp_occupancy_logit(_dense, args.sp_fea_steepness)
                     _ol = _ol.clamp(-5.0, 5.0)
                     _ol = torch.where(_br_t_ph, _ol, torch.tensor(-5.0, device=_ol.device, dtype=_ol.dtype))
                     if args.sp_shell_only:
@@ -4063,6 +4844,25 @@ def main():
         decoded = pipe.sparse_vae_512.decode_mesh(latents=latents_sp,
                                                    mc_threshold=args.mc_threshold,
                                                    return_feat=True)
+        if args.sp_dense_core_mm > 0 and args.sp_dense_core_project:
+            _core = _dense_core_mask(decoded[0].coords)
+            _sdf_before = decoded[0].feats
+            _core_target = min(sp_iso, args.mc_threshold * 2.0) - 0.1
+            _violating = int((_core & (_sdf_before.squeeze(-1) > _core_target)).sum().item())
+            decoded[0].feats = torch.where(
+                _core[:, None], torch.minimum(_sdf_before, torch.full_like(_sdf_before, _core_target)),
+                _sdf_before)
+            print(f"  [dense core] sparse decoder projected {_violating:,} "
+                  f"core SDF samples to <= {_core_target:.3f}", flush=True)
+        # Diagnostic only: compare the sparse decoder's surface with the refined one.
+        # This does not change either tensor or the generation path.
+        if os.environ.get('D3DS2_SAVE_PRE_REFINER', '0') == '1':
+            _pre = pipe.sparse_vae_512.sparse2mesh(
+                decoded[0], mc_threshold=args.mc_threshold * 2.0)[0]
+            _pre.export(str(Path(args.out) / 'mesh_pre_refiner.obj'))
+            print(f"  [diagnostic] pre-refiner mesh: V={len(_pre.vertices):,} "
+                  f"F={len(_pre.faces):,}")
+            del _pre
         # decode done — offload sparse_vae_512 too so refiner has max headroom
         try: pipe.sparse_vae_512.to('cpu')
         except Exception: pass

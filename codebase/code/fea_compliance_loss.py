@@ -28,7 +28,7 @@ backpropagated into the latent (with the sensitivity filter, main text);
 Supplementary Sparse-Stage Loss Terms term (6) Sparse-FEM compliance for the sparse stage.
 """
 from __future__ import annotations
-import subprocess, json, os
+import subprocess, json, os, re
 from pathlib import Path
 import numpy as np
 import torch
@@ -71,6 +71,11 @@ def call_fenics_fea(rho_inside: np.ndarray, nodes_inside: np.ndarray,
            '--mesh-size', str(mesh_size),
            '--penal', str(penal),
            '--load-magnitude', _os.environ.get('FEA_LOAD_MAGNITUDE', '42300.0')]
+    second_stl = _os.environ.get('FEA_SECOND_LOAD_STL')
+    if second_stl:
+        cmd += ['--second-load-stl', second_stl,
+                '--second-load-magnitude', _os.environ.get('FEA_SECOND_LOAD_MAGNITUDE', '200'),
+                '--second-load-mode', _os.environ.get('FEA_SECOND_LOAD_MODE', 'y')]
     if _os.environ.get('FEA_DIAG', '0') == '1':
         print(f'  [FEA-CMD] load={_os.environ.get("FEA_LOAD_MAGNITUDE", "42300.0")} '
               f'rho_in: min={rho_inside.min():.3f} max={rho_inside.max():.3f} mean={rho_inside.mean():.3f} n={len(rho_inside)}', flush=True)
@@ -83,7 +88,19 @@ def call_fenics_fea(rho_inside: np.ndarray, nodes_inside: np.ndarray,
     if res.returncode != 0:
         if verbose:
             print('FEA STDERR:', res.stderr[-500:])
-        raise RuntimeError(f'fenics_fea_bracket.py failed (exit {res.returncode})')
+        detail = (res.stderr or res.stdout).strip().splitlines()[-1:]
+        raise RuntimeError(f'fenics_fea_bracket.py failed (exit {res.returncode}): '
+                           f'{detail[0][:300] if detail else "no solver output"}')
+    fixed = re.search(r'Dirichlet:\s*(\d+)\s+nodes', res.stdout)
+    loaded = re.search(r'Load:\s*(\d+)\s+nodes', res.stdout)
+    if fixed is None or loaded is None or int(fixed.group(1)) == 0 or int(loaded.group(1)) == 0:
+        raise RuntimeError('FEniCS returned no valid fixed/load nodes; refusing a zero-load '
+                           f'compliance gradient. Solver tail: {res.stdout[-300:]}')
+    if second_stl:
+        second_loaded = re.search(r'Load2:\s*(\d+)\s+nodes', res.stdout)
+        if second_loaded is None or int(second_loaded.group(1)) == 0 or \
+                'Load combination: simultaneous' not in res.stdout:
+            raise RuntimeError('FEniCS did not apply both loads in one solve')
     if _os.environ.get('FEA_DIAG', '0') == '1':
         # fenics succeeded — print last few stdout lines to see compliance value reported
         for ln in res.stdout.strip().split('\n')[-3:]:

@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "experiment_id": "designer_steered_semantic_bo_qd_bracket_2026-09-22",
+  "domain": "bracket",
+  "training": false,
+  "reference_image": "experiments/bracket/direct3ds2_lowres_2026-09-15/lr162/input/\uadf8\ub9bc1.png",
+  "design_domain": "data_real/bracket/original_DesignSpace.stl",
+  "fixed_bc": "data_real/bracket/fixed_remesh.stl",
+  "load_bc": "data_real/bracket/load_remesh.stl",
+  "archive": {
+    "axes": [
+      "semantic_shape_niche",
+      "normalized_mass"
+    ],
+    "semantic_measurement": "nearest canonical text anchor using frozen image-text embeddings of final 3D multi-view renders",
+    "semantic_niches": {
+      "arch_tie": "a broad structural arch connected by a continuous lower tension tie",
+      "diagonal_truss": "a triangulated structural web dominated by continuous diagonal load paths",
+      "radial_fan": "a radial fan of structural ribs spreading from the load interfaces",
+      "branching": "a branching structural network with curved merging members",
+      "longitudinal_spine": "parallel longitudinal structural spines joined by transverse bridges",
+      "ring_lattice": "closed structural rings or lattice cells joined by redundant paths"
+    },
+    "mass_definition": "final watertight mesh volume divided by design-envelope volume; constant material density cancels",
+    "mass_edges": [
+      0.2,
+      0.28,
+      0.34,
+      0.4,
+      0.5
+    ],
+    "quality": "negative normalized multi-load compliance; higher is better",
+    "cells": 24
+  },
+  "hard_gates": {
+    "watertight": true,
+    "components_max": 1,
+    "fix_coverage_1p5mm_min": 0.7,
+    "load_coverage_1p5mm_min": 0.6,
+    "inside_envelope_fraction_min": 0.995,
+    "minimum_thickness_mm": 3.0,
+    "fea_required": true,
+    "designer_override": false
+  },
+  "outline_policy": {
+    "design_envelope_role": "maximum allowable region, not a target perimeter",
+    "fixed": [
+      "four mounting-bore interface pads",
+      "two left load-lug contact regions"
+    ],
+    "free": [
+      "outer perimeter away from BCs",
+      "taper",
+      "waist",
+      "concavity",
+      "asymmetry",
+      "internal topology"
+    ]
+  },
+  "conditions": {
+    "random": {
+      "selector": "stratified_random",
+      "designer_intervention": "none"
+    },
+    "auto_bo_qd": {
+      "selector": "realization_aware_semantic_bo_qd",
+      "designer_intervention": "none"
+    },
+    "initial_intent": {
+      "selector": "realization_aware_semantic_bo_qd",
+      "designer_intervention": "initial semantic-anchor weights and preferred mass range only"
+    },
+    "periodic_steering": {
+      "selector": "realization_aware_semantic_bo_qd",
+      "designer_intervention": "initial intent plus one blinded archive review after every completed round"
+    }
+  },
+  "pilot": {
+    "seeds": [
+      42
+    ],
+    "shared_warm_start_full_evaluations": 6,
+    "rounds": 3,
+    "image_candidates_per_round": 18,
+    "dense_evaluations_per_round": 6,
+    "sparse_fea_evaluations_per_round": 3
+  },
+  "main": {
+    "seeds": [
+      42,
+      314,
+      2718
+    ],
+    "shared_warm_start_full_evaluations": 6,
+    "rounds": 5,
+    "image_candidates_per_round": 24,
+    "dense_evaluations_per_round": 8,
+    "sparse_fea_evaluations_per_round": 4
+  },
+  "designer_protocol": {
+    "identity": "same designer for all designer-involved runs",
+    "initial_session_minutes_max": 10,
+    "checkpoint_minutes_max": 5,
+    "actions_per_checkpoint": {
+      "target_cells_max": 2,
+      "lock_candidates_max": 2,
+      "reject_candidates_max": 2,
+      "local_exploration_requests_max": 1
+    },
+    "information_visible": [
+      "candidate multi-view renders",
+      "realized semantic niche",
+      "normalized mass",
+      "hard-gate pass or failure",
+      "normalized FEA performance after evaluation"
+    ],
+    "information_hidden": [
+      "condition names during final preference evaluation",
+      "method-specific acquisition values during pairwise final selection"
+    ]
+  },
+  "primary_metrics": [
+    "preferred_niche_coverage",
+    "total_archive_coverage",
+    "cumulative_qd_hv",
+    "hard_gate_pass_rate",
+    "blind_designer_utility_of_final_pareto_set"
+  ],
+  "secondary_metrics": [
+    "semantic_realization_gap",
+    "final_3d_pairwise_shape_distance",
+    "best_compliance_per_mass_bin",
+    "image_to_dense_survival_rate",
+    "dense_to_sparse_survival_rate",
+    "wall_clock_time",
+    "designer_time_and_action_count",
+    "pairwise_outer_silhouette_distance"
+  ],
+  "fairness": {
+    "matched_foundation_models": true,
+    "matched_generation_parameters": true,
+    "matched_evaluation_seeds": true,
+    "matched_image_dense_sparse_fea_budgets": true,
+    "shared_warm_start_within_seed": true,
+    "no_posthoc_archive_edge_changes": true
+  },
+  "pipeline_overrides": {
+    "post_bc": {
+      "fixed_bc": "/home/goya/SDL/3d_qd/data_real/bracket/fixed_remesh.stl",
+      "load_bc": "/home/goya/SDL/3d_qd/data_real/bracket/load_remesh.stl",
+      "peg_dilate_mm": 6.0,
+      "reason": "uniform remeshed BC avoids legacy sliver-triangle debris; 6 mm collar selected by designer on 2026-09-22"
+    },
+    "fea_on": {
+      "dense_fea_w": 5e-11,
+      "dense_fea_every_n": 1,
+      "dense_fea_warmup": 0.2,
+      "sparse_fea_w": 3e-12,
+      "sparse_fea_every": 2,
+      "sparse_fea_warmup": 0.5,
+      "force_bc_dilate_mm": 6.0,
+      "post_peg_dilate_mm": 6.0
+    }
+  }
+}

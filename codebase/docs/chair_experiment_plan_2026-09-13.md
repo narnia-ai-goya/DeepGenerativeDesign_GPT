@@ -1,6 +1,23 @@
 # 의자 사례를 이용한 3D QD 실험안
 
-상태: 2026-09-13 계획. 의자 CAD, conditioning 이미지, 생성·FEA 결과는 아직 만들지 않았다. 아래는 실행 가능한 설정 파일이 아니라 구현·평가 명세다.
+상태: 2026-09-25 재검토. 의자 CAD, conditioning 이미지, 생성·FEA 결과는 아직 만들지 않았다. 아래는 실행 가능한 설정 파일이 아니라 구현·평가 명세다.
+
+## 2026-09-25 전환 결정: LMTO 의자와의 비교
+
+LMTO의 Fig. 9/Appendix C는 일반적인 네 다리 의자보다 펭귄·아보카도 외피와 좌석 공동이 결합된 단일체 개념 의자다. 논문은 80³ hexahedral 요소, 체적비 0.2, E=1, ν=0.3을 사용하고, Table 2에서 동일 체적비의 BESO와 의미 형상/컴플라이언스를 비교한다. 따라서 첫 실험은 `동일한 좌석·지지 기능을 가진 서로 다른 실루엣`으로 정의한다. 기존 bracket 데이터를 chair로 이름만 바꾸거나 bracket BC를 재사용하지 않는다.
+
+현재 저장소에는 `data_real/chair/` 원본 설계공간·fixed·load STL 및 검증 가능한 chair FEA 설정이 없다. `codebase/run_prep.py`가 요구하는 세 STL, 64³ voxel, FEA 도메인, tet mesh를 새로 준비해야 한다. 기존 생성기의 `load_mode`와 독립 FEA `force_dir`는 단일 하중 방향을 전제로 하므로, 논문 Fig. C.13의 복수 하중을 재현한다고 주장하지 않는다. 먼저 수직 좌판 하중 한 개로 구조 평가기를 검증하고, 이후 좌판/등받이 복수 하중을 별도 확장한다. 원문 정규화 수치와 우리 실제 단위 수치를 섞어 compliance 절댓값으로 비교하지 않는다.
+
+최근 bracket 파일럿에서 입력 이미지의 개구부가 dense 단계에서 사라지고, image-projection loss가 두 후보의 dense 충실도를 개선했으나 compliance 개선은 형상별로 달랐다. chair에서도 **이미지 충실도는 탐색/선호 축**, **최종 메쉬의 좌석 기능·BC·FEA·질량은 독립 검증**으로 유지한다. 기존 cached-dense와 fresh-dense 경로는 서로 다른 생성 연산이므로 동일 경로끼리 비교한다.
+
+실행 순서와 통과 조건:
+
+1. **BC 모델**: 공통 좌판 높이/유효 좌석 공동/바닥 지지 패치를 CAD와 도면에 명시한다. 동일 BC를 neutral, penguin, avocado에 고정한다.
+2. **도메인 preflight**: 새 STL 3개가 watertight인지, 64³ voxel에서 좌판/등받이 연결부가 최소 2 voxel 이상인지 확인한다. image-only dense에서 좌석 공동과 등받이가 남지 않으면 sparse/FEA 대량 실행을 중단하고 domain 해상도 또는 형상 스케일을 조정한다.
+3. **물리 preflight**: 수직 좌판 하중의 반력 평형, 고정/하중 patch 포함, tet 수렴을 먼저 확인한다. 초기 검증은 neutral 한 사례·한 seed로 제한한다.
+4. **작은 비교**: 동일 neutral CAD/BC와 이미지 view/seed에서 neutral, penguin, avocado 각각 최소 두 시각 변형을 생성한다. 이미지 prior만, FEA guidance, image-projection guidance의 최종 3D와 독립 FEA를 비교한다. 의미가 최종 3D에서 사라지면 prompt 수를 늘리기 전에 조건 전달을 수정한다.
+5. **QD loop**: 디자이너가 실루엣/좌석 공동/등받이 특징을 선택·수정하고, archive는 최종 3D의 형태 차이와 질량·컴플라이언스의 Pareto 관계로 갱신한다. 최종 렌더/메쉬에서 확인되지 않은 prompt 의미는 다양성으로 세지 않는다. 동일 생성·FEA 예산에서 random/image-only QD와 비교한다.
+6. **LMTO 비교**: 논문 Table 2의 수치는 문헌 참고선으로만 제시한다. 직접 성능 비교에는 동일한 의자 domain, BC, 재료, 하중, 질량 구간에서 재실행한 TO 기준선을 사용한다. 원 논문의 BC·코드·원본 3D 데이터가 확보되어 동일 조건을 재현한 경우에만 exact replication으로 표기한다.
 
 ## 연구에서의 역할
 
